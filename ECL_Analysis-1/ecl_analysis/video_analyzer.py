@@ -1,0 +1,5651 @@
+"""Main GUI for the Brightness Sorcerer application."""
+import customtkinter as ctk
+import tkinter as tk
+import json
+import logging
+import os
+from dataclasses import dataclass
+from string import Template
+from typing import List, Optional, Tuple
+
+import cv2
+import numpy as np
+from PyQt5 import QtCore, QtGui, QtWidgets
+
+from .analysis.background import (
+    compute_background_brightness as analysis_compute_background_brightness,
+)
+from .analysis.brightness import (
+    compute_brightness as analysis_compute_brightness,
+    compute_brightness_stats as analysis_compute_brightness_stats,
+    compute_l_star_frame as analysis_compute_l_star_frame,
+)
+from .analysis.duration import validate_run_duration as analysis_validate_run_duration
+from .analysis.models import AnalysisRequest, AnalysisResult
+from .audio import AudioAnalyzer, AudioManager
+from .cache import FrameCache
+from .constants import (
+    APP_WINDOW_TITLE,
+    COLOR_ACCENT,
+    COLOR_ACCENT_HOVER,
+    COLOR_BACKGROUND,
+    COLOR_BRIGHTNESS_LABEL,
+    COLOR_FOREGROUND,
+    COLOR_INFO,
+    COLOR_SECONDARY,
+    COLOR_SECONDARY_LIGHT,
+    COLOR_SUCCESS,
+    COLOR_WARNING,
+    DEFAULT_FONT_FAMILY,
+    DEFAULT_MANUAL_THRESHOLD,
+    DEFAULT_SETTINGS_FILE,
+    FRAME_CACHE_SIZE,
+    JUMP_FRAMES,
+    MAX_RECENT_FILES,
+    MORPHOLOGICAL_KERNEL_SIZE,
+    MOUSE_RESIZE_HANDLE_SENSITIVITY,
+    ROI_COLORS,
+    ROI_LABEL_FONT_SCALE,
+    ROI_LABEL_THICKNESS,
+    ROI_THICKNESS_DEFAULT,
+    ROI_DUPLICATE_OFFSET,
+    ROI_THICKNESS_SELECTED,
+)
+from .dependencies import get_plotly
+from .export.csv_exporter import ExportOptions, save_analysis_outputs
+from .workers import (
+    AnalysisWorker,
+    AudioDetectionWorker,
+    BrightestFrameResult,
+    BrightestFrameWorker,
+    MaskScanRequest,
+    PerRoiMaskCaptureResult,
+    PerRoiMaskCaptureWorker,
+)
+from .roi_geometry import (
+    get_pixmap_rect_in_label as geometry_get_pixmap_rect_in_label,
+    map_frame_to_label_point as geometry_map_frame_to_label_point,
+    map_label_to_frame_point as geometry_map_label_to_frame_point,
+    map_label_to_frame_rect as geometry_map_label_to_frame_rect,
+    scale_value_for_pixmap as geometry_scale_value_for_pixmap,
+)
+
+
+def _hex_to_rgba(color: str, alpha: float) -> str:
+    """Convert a hex color string like '#RRGGBB' to an rgba() string."""
+    stripped = color.lstrip('#')
+    if len(stripped) != 6:
+        raise ValueError("Expected a 6-character hex color.")
+    r = int(stripped[0:2], 16)
+    g = int(stripped[2:4], 16)
+    b = int(stripped[4:6], 16)
+    clamped_alpha = max(0.0, min(1.0, float(alpha)))
+    return f"rgba({r},{g},{b},{clamped_alpha})"
+
+
+def _offset_rect_within_bounds(
+    rect: Tuple[Tuple[int, int], Tuple[int, int]],
+    dx: int,
+    dy: int,
+    frame_shape: Optional[Tuple[int, int]] = None,
+) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    """Return a rectangle shifted by (dx, dy), clamped to optional frame bounds."""
+    (x1, y1), (x2, y2) = rect
+    left, right = sorted((int(x1), int(x2)))
+    top, bottom = sorted((int(y1), int(y2)))
+
+    new_left = left + int(dx)
+    new_right = right + int(dx)
+    new_top = top + int(dy)
+    new_bottom = bottom + int(dy)
+
+    if frame_shape is not None:
+        frame_h, frame_w = frame_shape
+
+        if frame_w > 0:
+            min_x = 0
+            max_x = frame_w - 1
+            if new_left < min_x:
+                shift_x = min_x - new_left
+                new_left += shift_x
+                new_right += shift_x
+            if new_right > max_x:
+                shift_x = new_right - max_x
+                new_left -= shift_x
+                new_right -= shift_x
+            new_left = max(min_x, min(new_left, max_x))
+            new_right = max(min_x, min(new_right, max_x))
+            if new_right <= new_left and frame_w > 1:
+                new_right = min(max_x, new_left + 1)
+
+        if frame_h > 0:
+            min_y = 0
+            max_y = frame_h - 1
+            if new_top < min_y:
+                shift_y = min_y - new_top
+                new_top += shift_y
+                new_bottom += shift_y
+            if new_bottom > max_y:
+                shift_y = new_bottom - max_y
+                new_top -= shift_y
+                new_bottom -= shift_y
+            new_top = max(min_y, min(new_top, max_y))
+            new_bottom = max(min_y, min(new_bottom, max_y))
+            if new_bottom <= new_top and frame_h > 1:
+                new_bottom = min(max_y, new_top + 1)
+
+    return ((new_left, new_top), (new_right, new_bottom))
+
+
+@dataclass
+class EditorSnapshot:
+    """Serializable snapshot of the mutable editor state."""
+
+    current_frame_index: int
+    start_frame: int
+    end_frame: Optional[int]
+    rects: List[Tuple[Tuple[int, int], Tuple[int, int]]]
+    selected_rect_idx: Optional[int]
+    background_roi_idx: Optional[int]
+    manual_threshold: float
+    morphological_kernel_size: int
+    background_percentile: float
+    noise_floor_threshold: float
+    use_fixed_mask: bool
+    fixed_roi_masks: List[Optional[np.ndarray]]
+    mask_source_frames: List[Optional[int]]
+
+
+@dataclass
+class HistoryEntry:
+    """Undo/redo entry for editor changes."""
+
+    label: str
+    before: EditorSnapshot
+    after: EditorSnapshot
+
+
+class AnalysisRangeSlider(QtWidgets.QWidget):
+    """Compact range editor that shows and drags the active analysis window."""
+
+    rangeChanged = QtCore.pyqtSignal(int, int)
+    rangeEditStarted = QtCore.pyqtSignal()
+    rangeEditFinished = QtCore.pyqtSignal()
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(parent)
+        self._minimum = 0
+        self._maximum = 0
+        self._start = 0
+        self._end = 0
+        self._current = 0
+        self._drag_mode: Optional[str] = None
+        self._drag_origin_pos = 0
+        self._drag_origin_range = (0, 0)
+        self.setMinimumHeight(28)
+        self.setMouseTracking(True)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
+    def set_range(self, minimum: int, maximum: int):
+        self._minimum = int(minimum)
+        self._maximum = max(int(minimum), int(maximum))
+        self._start = max(self._minimum, min(self._start, self._maximum))
+        self._end = max(self._start, min(self._end, self._maximum))
+        self._current = max(self._minimum, min(self._current, self._maximum))
+        self.update()
+
+    def set_values(self, start: int, end: int):
+        clamped_start = max(self._minimum, min(int(start), self._maximum))
+        clamped_end = max(clamped_start, min(int(end), self._maximum))
+        if (clamped_start, clamped_end) == (self._start, self._end):
+            return
+        self._start = clamped_start
+        self._end = clamped_end
+        self.update()
+
+    def set_current_value(self, value: int):
+        clamped_value = max(self._minimum, min(int(value), self._maximum))
+        if clamped_value == self._current:
+            return
+        self._current = clamped_value
+        self.update()
+
+    def _track_rect(self) -> QtCore.QRectF:
+        margin_x = 12.0
+        track_height = 8.0
+        y = (self.height() - track_height) / 2.0
+        return QtCore.QRectF(
+            margin_x,
+            y,
+            max(1.0, self.width() - (margin_x * 2.0)),
+            track_height,
+        )
+
+    def _value_to_pos(self, value: int) -> float:
+        track = self._track_rect()
+        span = max(1, self._maximum - self._minimum)
+        ratio = (value - self._minimum) / span
+        return track.left() + (track.width() * ratio)
+
+    def _pos_to_value(self, pos_x: float) -> int:
+        track = self._track_rect()
+        if track.width() <= 0:
+            return self._minimum
+        ratio = (pos_x - track.left()) / track.width()
+        ratio = max(0.0, min(1.0, ratio))
+        value = self._minimum + round(ratio * (self._maximum - self._minimum))
+        return max(self._minimum, min(value, self._maximum))
+
+    def _handle_hit_test(self, pos: QtCore.QPoint) -> Optional[str]:
+        if self._maximum <= self._minimum:
+            return None
+
+        x = pos.x()
+        start_x = self._value_to_pos(self._start)
+        end_x = self._value_to_pos(self._end)
+        tolerance = 12.0
+
+        if abs(x - start_x) <= tolerance:
+            return "start"
+        if abs(x - end_x) <= tolerance:
+            return "end"
+
+        window_left = min(start_x, end_x)
+        window_right = max(start_x, end_x)
+        if window_left <= x <= window_right:
+            return "window"
+        return None
+
+    def _emit_drag_update(self, pos_x: float):
+        if self._drag_mode is None:
+            return
+
+        if self._drag_mode == "window":
+            anchor_value = self._pos_to_value(self._drag_origin_pos)
+            current_value = self._pos_to_value(pos_x)
+            delta = current_value - anchor_value
+            origin_start, origin_end = self._drag_origin_range
+            width = origin_end - origin_start
+            new_start = origin_start + delta
+            new_end = origin_end + delta
+            if new_start < self._minimum:
+                new_end += self._minimum - new_start
+                new_start = self._minimum
+            if new_end > self._maximum:
+                new_start -= new_end - self._maximum
+                new_end = self._maximum
+            new_start = max(self._minimum, min(new_start, self._maximum))
+            new_end = max(new_start, min(new_end, self._maximum))
+        elif self._drag_mode == "start":
+            new_start = self._pos_to_value(pos_x)
+            new_start = min(new_start, self._end)
+            new_end = self._end
+        else:
+            new_end = self._pos_to_value(pos_x)
+            new_end = max(new_end, self._start)
+            new_start = self._start
+
+        if (new_start, new_end) != (self._start, self._end):
+            self._start = new_start
+            self._end = new_end
+            self.rangeChanged.emit(self._start, self._end)
+            self.update()
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent):
+        if event.button() != QtCore.Qt.LeftButton or self._maximum <= self._minimum:
+            super().mousePressEvent(event)
+            return
+
+        self._drag_mode = self._handle_hit_test(event.pos())
+        if self._drag_mode is None:
+            midpoint = (self._value_to_pos(self._start) + self._value_to_pos(self._end)) / 2.0
+            self._drag_mode = "start" if event.pos().x() <= midpoint else "end"
+
+        self._drag_origin_pos = event.pos().x()
+        self._drag_origin_range = (self._start, self._end)
+        self.rangeEditStarted.emit()
+        self._emit_drag_update(event.pos().x())
+        event.accept()
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent):
+        if self._drag_mode is not None:
+            self._emit_drag_update(event.pos().x())
+            event.accept()
+            return
+
+        hovered = self._handle_hit_test(event.pos())
+        if hovered in {"start", "end"}:
+            self.setCursor(QtCore.Qt.SizeHorCursor)
+        elif hovered == "window":
+            self.setCursor(QtCore.Qt.OpenHandCursor)
+        else:
+            self.unsetCursor()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent):
+        if event.button() == QtCore.Qt.LeftButton and self._drag_mode is not None:
+            self._drag_mode = None
+            self.unsetCursor()
+            self.rangeEditFinished.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event: QtGui.QPaintEvent):
+        super().paintEvent(event)
+
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
+        track = self._track_rect()
+        base_color = QtGui.QColor(COLOR_SECONDARY_LIGHT)
+        base_color.setAlpha(220)
+        window_color = QtGui.QColor(COLOR_ACCENT)
+        window_color.setAlpha(170)
+        handle_fill = QtGui.QColor(COLOR_BACKGROUND)
+        handle_border = QtGui.QColor(COLOR_ACCENT)
+        current_line = QtGui.QColor(COLOR_INFO)
+
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(base_color)
+        painter.drawRoundedRect(track, 4, 4)
+
+        if self._maximum > self._minimum:
+            start_x = self._value_to_pos(self._start)
+            end_x = self._value_to_pos(self._end)
+            selected = QtCore.QRectF(
+                min(start_x, end_x),
+                track.top(),
+                max(6.0, abs(end_x - start_x)),
+                track.height(),
+            )
+            painter.setBrush(window_color)
+            painter.drawRoundedRect(selected, 4, 4)
+
+            painter.setPen(QtGui.QPen(current_line, 2))
+            current_x = self._value_to_pos(self._current)
+            painter.drawLine(
+                QtCore.QPointF(current_x, track.top() - 6),
+                QtCore.QPointF(current_x, track.bottom() + 6),
+            )
+
+            for value, label in ((self._start, "S"), (self._end, "E")):
+                handle_x = self._value_to_pos(value)
+                handle_rect = QtCore.QRectF(handle_x - 7, track.center().y() - 7, 14, 14)
+                painter.setPen(QtGui.QPen(handle_border, 1.5))
+                painter.setBrush(handle_fill)
+                painter.drawEllipse(handle_rect)
+                painter.setPen(QtGui.QPen(handle_border))
+                painter.setFont(QtGui.QFont(DEFAULT_FONT_FAMILY, 7, QtGui.QFont.Bold))
+                painter.drawText(handle_rect, QtCore.Qt.AlignCenter, label)
+
+class VideoAnalyzer(QtWidgets.QMainWindow):  # Changed to QMainWindow for better menu support
+    """Main application window for video brightness analysis."""
+    
+    def __init__(self):
+        """Initializes the application window and UI elements."""
+        super().__init__()
+        self._init_vars()
+        self._load_settings()
+        self._init_ui()
+        self._create_menus()
+
+    def _init_vars(self):
+        """Initialize instance variables."""
+        self.video_path = None
+        self.frame = None
+        self.current_frame_index = 0
+        self.total_frames = 0
+        self.cap = None
+        self.out_paths = []
+        
+        # Frame caching
+        self.frame_cache_size = FRAME_CACHE_SIZE
+        self.frame_cache = FrameCache(self.frame_cache_size)
+        
+        # Audio system
+        self.audio_manager = AudioManager()
+        self.audio_analyzer = AudioAnalyzer()
+
+        # Background worker threads
+        self._analysis_thread: Optional[QtCore.QThread] = None
+        self._analysis_worker: Optional[AnalysisWorker] = None
+        self._analysis_progress: Optional[QtWidgets.QProgressDialog] = None
+        self._analysis_save_dir: Optional[str] = None
+        self._pending_export_options: Optional[ExportOptions] = None
+
+        self._audio_thread: Optional[QtCore.QThread] = None
+        self._audio_worker: Optional[AudioDetectionWorker] = None
+        self._audio_progress: Optional[QtWidgets.QProgressDialog] = None
+        self._pending_audio_expected_duration: float = 0.0
+
+        self._mask_thread: Optional[QtCore.QThread] = None
+        self._mask_worker: Optional[QtCore.QObject] = None
+        self._mask_progress: Optional[QtWidgets.QProgressDialog] = None
+        self._mask_task_type: Optional[str] = None
+        
+        # Recent files
+        self.recent_files = []
+        
+        # ROI management
+        self.rects = []
+        self.selected_rect_idx = None
+        self.drawing = False
+        self.moving = False
+        self.resizing = False
+        self.start_point = None
+        self.end_point = None
+        self.move_offset = None
+        self.resize_corner = None
+        self.resize_origin_rect = None
+        self.resize_aspect_ratio = None
+        self._current_image_size = None
+        
+        # Frame range
+        self.start_frame = 0
+        self.end_frame = None
+        
+        # Analysis state
+        self._analysis_in_progress = False
+        self._history_restoring = False
+        self._undo_history: List[HistoryEntry] = []
+        self._redo_history: List[HistoryEntry] = []
+        self._pending_history_entry: Optional[Tuple[str, EditorSnapshot]] = None
+        
+        # Settings
+        self.settings = {}
+        
+        # Threshold / background
+        self.manual_threshold = DEFAULT_MANUAL_THRESHOLD
+        self.background_roi_idx = None       # index into self.rects
+        
+        # Pixel visualization
+        self.show_pixel_mask = False
+        # Fixed mask across frames
+        self.use_fixed_mask = False
+        self.fixed_roi_masks: List[Optional[np.ndarray]] = []  # aligned with self.rects
+        self.mask_source_frames: List[Optional[int]] = []  # frame index each mask was captured from
+
+        # Noise filtering parameters (adjustable via UI)
+        self.morphological_kernel_size = MORPHOLOGICAL_KERNEL_SIZE
+        self.background_percentile = 90.0  # For background ROI threshold calculation
+        self.noise_floor_threshold = 0.0   # Additional noise floor filtering
+
+        # Video playback
+        self.is_playing = False
+        self.playback_timer = QtCore.QTimer()
+        self.playback_fps = 30.0  # Default playback FPS
+        self.playback_speed = 1.0  # Playback speed multiplier
+
+    def _load_settings(self):
+        """Load application settings from file."""
+        try:
+            if os.path.exists(DEFAULT_SETTINGS_FILE):
+                with open(DEFAULT_SETTINGS_FILE, 'r') as f:
+                    self.settings = json.load(f)
+                    self.recent_files = self.settings.get('recent_files', [])
+                    
+                    # Load audio settings
+                    audio_enabled = self.settings.get('audio_enabled', True)
+                    audio_volume = self.settings.get('audio_volume', 0.7)
+                    self.audio_manager.set_enabled(audio_enabled)
+                    self.audio_manager.set_volume(audio_volume)
+
+                    # Load performance settings
+                    configured_cache = int(self.settings.get('frame_cache_size', FRAME_CACHE_SIZE))
+                    self.frame_cache_size = max(10, min(2000, configured_cache))
+                    self.frame_cache = FrameCache(self.frame_cache_size)
+
+        except Exception as e:
+            logging.warning(f"Could not load settings: {e}")
+            self.settings = {}
+            self.recent_files = []
+
+    def _save_settings(self):
+        """Save application settings to file."""
+        try:
+            self.settings['recent_files'] = self.recent_files
+            self.settings['audio_enabled'] = self.audio_manager.enabled
+            self.settings['audio_volume'] = self.audio_manager.volume
+            self.settings['frame_cache_size'] = int(self.frame_cache_size)
+            with open(DEFAULT_SETTINGS_FILE, 'w') as f:
+                json.dump(self.settings, f, indent=2)
+        except Exception as e:
+            logging.warning(f"Could not save settings: {e}")
+
+    def _add_recent_file(self, file_path: str):
+        """Add file to recent files list."""
+        if file_path in self.recent_files:
+            self.recent_files.remove(file_path)
+        self.recent_files.insert(0, file_path)
+        self.recent_files = self.recent_files[:MAX_RECENT_FILES]
+        self._update_recent_files_menu()
+
+    def _init_ui(self):
+        """Set up the main UI layout and widgets."""
+        self.setWindowTitle(APP_WINDOW_TITLE)
+        self.setGeometry(100, 100, 1400, 900)  # Larger default size
+        self.setAcceptDrops(True)
+        self._apply_stylesheet()
+
+        # Create central widget and main layout
+        central_widget = QtWidgets.QWidget()
+        self.setCentralWidget(central_widget)
+        self.main_layout = QtWidgets.QHBoxLayout(central_widget)
+
+        self._create_actions()
+        self._create_layouts()
+        self._create_widgets()
+        self._connect_signals()
+        self._setup_shortcuts()
+        self._update_widget_states()
+        # After widgets exist, set a sensible initial split
+        self._set_default_splitter_sizes()
+
+    def _create_actions(self):
+        """Create shared actions used across menus, buttons, and shortcuts."""
+        self.undo_action = QtWidgets.QAction("Undo", self)
+        self.undo_action.setStatusTip("Undo the last editor change")
+        self.undo_action.triggered.connect(self.undo_last_action)
+
+        self.redo_action = QtWidgets.QAction("Redo", self)
+        self.redo_action.setStatusTip("Redo the most recently undone change")
+        self.redo_action.triggered.connect(self.redo_last_action)
+
+        self.clear_rect_btn_action = QtWidgets.QAction("Clear All ROIs", self)
+        self.clear_rect_btn_action.setStatusTip("Delete all ROIs")
+        self.clear_rect_btn_action.triggered.connect(self.clear_all_rectangles)
+
+        self._update_history_actions()
+
+    def _create_menus(self):
+        """Create application menus."""
+        menubar = self.menuBar()
+        
+        # File menu
+        file_menu = menubar.addMenu('&File')
+        
+        open_action = QtWidgets.QAction('&Open Video...', self)
+        open_action.setShortcut('Ctrl+O')
+        open_action.setStatusTip('Open a video file')
+        open_action.triggered.connect(self.open_video_dialog)
+        file_menu.addAction(open_action)
+        
+        file_menu.addSeparator()
+        
+        # Recent files submenu
+        self.recent_files_menu = file_menu.addMenu('Recent Files')
+        self._update_recent_files_menu()
+        
+        file_menu.addSeparator()
+        
+        exit_action = QtWidgets.QAction('E&xit', self)
+        exit_action.setShortcut('Ctrl+Q')
+        exit_action.setStatusTip('Exit the application')
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+
+        edit_menu = menubar.addMenu('&Edit')
+        edit_menu.addAction(self.undo_action)
+        edit_menu.addAction(self.redo_action)
+        edit_menu.addSeparator()
+        edit_menu.addAction(self.clear_rect_btn_action)
+        
+        # Analysis menu
+        analysis_menu = menubar.addMenu('&Analysis')
+        
+        analyze_action = QtWidgets.QAction('&Run Analysis', self)
+        analyze_action.setShortcut('F5')
+        analyze_action.setStatusTip('Run brightness analysis')
+        analyze_action.triggered.connect(self.analyze_video)
+        analysis_menu.addAction(analyze_action)
+        
+        auto_detect_action = QtWidgets.QAction('&Detect from Audio', self)
+        auto_detect_action.setShortcut('Ctrl+D')
+        auto_detect_action.setStatusTip('Detect completion beeps in audio and calculate frame ranges')
+        auto_detect_action.triggered.connect(self.auto_detect_range)
+        analysis_menu.addAction(auto_detect_action)
+        
+        # View menu
+        view_menu = menubar.addMenu('&View')
+        reset_layout_action = QtWidgets.QAction('&Reset Layout', self)
+        reset_layout_action.setStatusTip('Reset splitter sizes and panel widths')
+        reset_layout_action.triggered.connect(self._set_default_splitter_sizes)
+        view_menu.addAction(reset_layout_action)
+
+        # Settings menu
+        settings_menu = menubar.addMenu('&Settings')
+        
+        audio_settings_action = QtWidgets.QAction('&Audio Settings...', self)
+        audio_settings_action.setStatusTip('Configure audio feedback settings')
+        audio_settings_action.triggered.connect(self._show_audio_settings_dialog)
+        settings_menu.addAction(audio_settings_action)
+        
+        # Help menu
+        help_menu = menubar.addMenu('&Help')
+        
+        shortcuts_action = QtWidgets.QAction('&Keyboard Shortcuts', self)
+        shortcuts_action.triggered.connect(self._show_shortcuts_dialog)
+        help_menu.addAction(shortcuts_action)
+        
+        about_action = QtWidgets.QAction('&About', self)
+        about_action.triggered.connect(self._show_about_dialog)
+        help_menu.addAction(about_action)
+        
+        # Status bar
+        self.statusBar().showMessage('Ready - Load a video to begin')
+
+    def _update_recent_files_menu(self):
+        """Update the recent files menu."""
+        self.recent_files_menu.clear()
+        
+        if not self.recent_files:
+            no_recent_action = QtWidgets.QAction('No recent files', self)
+            no_recent_action.setEnabled(False)
+            self.recent_files_menu.addAction(no_recent_action)
+            return
+        
+        for file_path in self.recent_files:
+            if os.path.exists(file_path):
+                action = QtWidgets.QAction(os.path.basename(file_path), self)
+                action.setStatusTip(file_path)
+                action.triggered.connect(lambda _checked, path=file_path: self._open_recent_file(path))
+                self.recent_files_menu.addAction(action)
+
+    def _open_recent_file(self, file_path: str):
+        """Open a file from the recent files list."""
+        if os.path.exists(file_path):
+            self.video_path = file_path
+            self.load_video()
+        else:
+            QtWidgets.QMessageBox.warning(self, 'File Not Found', 
+                                        f'The file {file_path} no longer exists.')
+            self.recent_files.remove(file_path)
+            self._update_recent_files_menu()
+
+    def _setup_shortcuts(self):
+        """Setup keyboard shortcuts."""
+        self.undo_action.setShortcuts(
+            [
+                QtGui.QKeySequence.Undo,
+                QtGui.QKeySequence("Ctrl+Z"),
+                QtGui.QKeySequence("Meta+Z"),
+            ]
+        )
+        self.redo_action.setShortcuts(
+            [
+                QtGui.QKeySequence.Redo,
+                QtGui.QKeySequence("Ctrl+Y"),
+                QtGui.QKeySequence("Meta+Shift+Z"),
+            ]
+        )
+
+        # Playback shortcuts
+        QtWidgets.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Space), self, 
+                          self.toggle_playback)
+        
+        # Frame navigation / ROI nudge shortcuts
+        QtWidgets.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Left), self, 
+                          lambda: self._handle_horizontal_shortcut(-1, accelerated=False))
+        QtWidgets.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Right), self, 
+                          lambda: self._handle_horizontal_shortcut(1, accelerated=False))
+        QtWidgets.QShortcut(QtGui.QKeySequence("Shift+Left"), self, 
+                          lambda: self._handle_horizontal_shortcut(-1, accelerated=True))
+        QtWidgets.QShortcut(QtGui.QKeySequence("Shift+Right"), self, 
+                          lambda: self._handle_horizontal_shortcut(1, accelerated=True))
+        QtWidgets.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Up), self, 
+                          lambda: self._handle_vertical_nudge_shortcut(-1, accelerated=False))
+        QtWidgets.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Down), self, 
+                          lambda: self._handle_vertical_nudge_shortcut(1, accelerated=False))
+        QtWidgets.QShortcut(QtGui.QKeySequence("Shift+Up"), self, 
+                          lambda: self._handle_vertical_nudge_shortcut(-1, accelerated=True))
+        QtWidgets.QShortcut(QtGui.QKeySequence("Shift+Down"), self, 
+                          lambda: self._handle_vertical_nudge_shortcut(1, accelerated=True))
+        QtWidgets.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Backspace), self, 
+                          lambda: self.step_frames(-1))
+        
+        # Jump navigation
+        QtWidgets.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_PageDown), self, 
+                          lambda: self.step_frames(JUMP_FRAMES))
+        QtWidgets.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_PageUp), self, 
+                          lambda: self.step_frames(-JUMP_FRAMES))
+        
+        # Go to start/end
+        QtWidgets.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Home), self, 
+                          lambda: self.frame_slider.setValue(0))
+        QtWidgets.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_End), self, 
+                          lambda: self.frame_slider.setValue(self.total_frames - 1))
+        
+        # ROI shortcuts
+        QtWidgets.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Delete), self, 
+                          self.delete_selected_rectangle)
+        QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+Shift+D"), self, 
+                          self.duplicate_selected_rectangle)
+        QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+Alt+D"), self, 
+                          self.duplicate_selected_rectangle_multiple)
+        QtWidgets.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Escape), self, 
+                          self._cancel_current_action)
+
+    def _cancel_current_action(self):
+        """Cancel current drawing/moving/resizing action."""
+        if self._analysis_in_progress:
+            self._cancel_active_worker()
+            return
+
+        if self.drawing:
+            self._restore_pending_history_snapshot()
+            self.add_rect_btn.setChecked(False)
+            self.toggle_add_rectangle_mode(False)
+        elif self.moving or self.resizing:
+            self._restore_pending_history_snapshot()
+            self.moving = False
+            self.resizing = False
+            self.start_point = None
+            self.end_point = None
+            self.move_offset = None
+            self.resize_corner = None
+            self.resize_origin_rect = None
+            self.resize_aspect_ratio = None
+            self.image_label.unsetCursor()
+            self.show_frame()
+
+    def _clone_mask_list(self, masks: List[Optional[np.ndarray]]) -> List[Optional[np.ndarray]]:
+        """Deep-copy masks for history snapshots."""
+        return [mask.copy() if isinstance(mask, np.ndarray) else None for mask in masks]
+
+    def _capture_editor_snapshot(self) -> EditorSnapshot:
+        """Capture the mutable editor state for undo/redo."""
+        return EditorSnapshot(
+            current_frame_index=int(self.current_frame_index),
+            start_frame=int(self.start_frame or 0),
+            end_frame=None if self.end_frame is None else int(self.end_frame),
+            rects=[((int(pt1[0]), int(pt1[1])), (int(pt2[0]), int(pt2[1]))) for pt1, pt2 in self.rects],
+            selected_rect_idx=self.selected_rect_idx,
+            background_roi_idx=self.background_roi_idx,
+            manual_threshold=float(self.manual_threshold),
+            morphological_kernel_size=int(self.morphological_kernel_size),
+            background_percentile=float(self.background_percentile),
+            noise_floor_threshold=float(self.noise_floor_threshold),
+            use_fixed_mask=bool(self.use_fixed_mask),
+            fixed_roi_masks=self._clone_mask_list(self.fixed_roi_masks),
+            mask_source_frames=[None if value is None else int(value) for value in self.mask_source_frames],
+        )
+
+    def _snapshots_equal(self, first: EditorSnapshot, second: EditorSnapshot) -> bool:
+        """Compare two editor snapshots, including mask arrays."""
+        scalar_fields_match = (
+            first.current_frame_index == second.current_frame_index
+            and first.start_frame == second.start_frame
+            and first.end_frame == second.end_frame
+            and first.rects == second.rects
+            and first.selected_rect_idx == second.selected_rect_idx
+            and first.background_roi_idx == second.background_roi_idx
+            and first.manual_threshold == second.manual_threshold
+            and first.morphological_kernel_size == second.morphological_kernel_size
+            and first.background_percentile == second.background_percentile
+            and first.noise_floor_threshold == second.noise_floor_threshold
+            and first.use_fixed_mask == second.use_fixed_mask
+            and first.mask_source_frames == second.mask_source_frames
+        )
+        if not scalar_fields_match or len(first.fixed_roi_masks) != len(second.fixed_roi_masks):
+            return False
+
+        for first_mask, second_mask in zip(first.fixed_roi_masks, second.fixed_roi_masks):
+            if first_mask is None and second_mask is None:
+                continue
+            if (first_mask is None) != (second_mask is None):
+                return False
+            if not np.array_equal(first_mask, second_mask):
+                return False
+        return True
+
+    def _begin_history_action(self, label: str):
+        """Start recording a multi-step edit gesture."""
+        if self._history_restoring:
+            return
+        self._pending_history_entry = (label, self._capture_editor_snapshot())
+
+    def _record_history_change(self, label: str, before: EditorSnapshot):
+        """Push a completed history entry when state changed."""
+        if self._history_restoring:
+            return
+
+        after = self._capture_editor_snapshot()
+        if self._snapshots_equal(before, after):
+            return
+
+        self._undo_history.append(HistoryEntry(label=label, before=before, after=after))
+        self._redo_history.clear()
+        self._update_history_actions()
+
+    def _commit_history_action(self):
+        """Finish the active multi-step edit gesture."""
+        if self._pending_history_entry is None:
+            return
+        label, before = self._pending_history_entry
+        self._pending_history_entry = None
+        self._record_history_change(label, before)
+
+    def _restore_pending_history_snapshot(self):
+        """Revert the active gesture to its starting point without recording history."""
+        if self._pending_history_entry is None:
+            return
+        _label, before = self._pending_history_entry
+        self._pending_history_entry = None
+        self._restore_editor_snapshot(before)
+
+    def _reset_history(self):
+        """Clear undo/redo history, typically when loading a new video."""
+        self._undo_history.clear()
+        self._redo_history.clear()
+        self._pending_history_entry = None
+        self._update_history_actions()
+
+    def _update_history_actions(self):
+        """Sync enabled state and labels for undo/redo actions."""
+        can_undo = bool(getattr(self, "_undo_history", []))
+        can_redo = bool(getattr(self, "_redo_history", []))
+
+        undo_label = self._undo_history[-1].label if can_undo else None
+        redo_label = self._redo_history[-1].label if can_redo else None
+
+        can_use_history = not getattr(self, "_analysis_in_progress", False)
+        self.undo_action.setEnabled(can_undo and can_use_history)
+        self.redo_action.setEnabled(can_redo and can_use_history)
+        self.undo_action.setText(f"Undo {undo_label}" if undo_label else "Undo")
+        self.redo_action.setText(f"Redo {redo_label}" if redo_label else "Redo")
+
+        if hasattr(self, "undo_btn"):
+            self.undo_btn.setEnabled(can_undo and can_use_history)
+            self.undo_btn.setToolTip(
+                f"Undo {undo_label} ({QtGui.QKeySequence(QtGui.QKeySequence.Undo).toString()})"
+                if undo_label
+                else f"Undo ({QtGui.QKeySequence(QtGui.QKeySequence.Undo).toString()})"
+            )
+        if hasattr(self, "redo_btn"):
+            self.redo_btn.setEnabled(can_redo and can_use_history)
+            self.redo_btn.setToolTip(
+                f"Redo {redo_label} ({QtGui.QKeySequence(QtGui.QKeySequence.Redo).toString()})"
+                if redo_label
+                else f"Redo ({QtGui.QKeySequence(QtGui.QKeySequence.Redo).toString()})"
+            )
+
+    def _restore_editor_snapshot(self, snapshot: EditorSnapshot):
+        """Restore a prior editor state without creating a new history entry."""
+        self._history_restoring = True
+        try:
+            self.rects = [((pt1[0], pt1[1]), (pt2[0], pt2[1])) for pt1, pt2 in snapshot.rects]
+            self.selected_rect_idx = snapshot.selected_rect_idx
+            self.background_roi_idx = snapshot.background_roi_idx
+            self.start_frame = snapshot.start_frame
+            self.end_frame = snapshot.end_frame
+            self.manual_threshold = snapshot.manual_threshold
+            self.morphological_kernel_size = snapshot.morphological_kernel_size
+            self.background_percentile = snapshot.background_percentile
+            self.noise_floor_threshold = snapshot.noise_floor_threshold
+            self.use_fixed_mask = snapshot.use_fixed_mask
+            self.fixed_roi_masks = self._clone_mask_list(snapshot.fixed_roi_masks)
+            self.mask_source_frames = list(snapshot.mask_source_frames)
+
+            if hasattr(self, "threshold_spin"):
+                self.threshold_spin.blockSignals(True)
+                self.threshold_spin.setValue(self.manual_threshold)
+                self.threshold_spin.blockSignals(False)
+            if hasattr(self, "kernel_size_slider"):
+                self.kernel_size_slider.blockSignals(True)
+                self.kernel_size_slider.setValue(self.morphological_kernel_size)
+                self.kernel_size_slider.blockSignals(False)
+                self.kernel_size_label.setText(f"{self.morphological_kernel_size}×{self.morphological_kernel_size}")
+            if hasattr(self, "bg_percentile_slider"):
+                self.bg_percentile_slider.blockSignals(True)
+                self.bg_percentile_slider.setValue(int(round(self.background_percentile)))
+                self.bg_percentile_slider.blockSignals(False)
+                self.bg_percentile_label.setText(f"{self.background_percentile:.0f}%")
+            if hasattr(self, "noise_floor_slider"):
+                self.noise_floor_slider.blockSignals(True)
+                self.noise_floor_slider.setValue(int(round(self.noise_floor_threshold * 2)))
+                self.noise_floor_slider.blockSignals(False)
+                self.noise_floor_label.setText(f"{self.noise_floor_threshold:.1f}")
+            if hasattr(self, "use_fixed_mask_checkbox"):
+                self.use_fixed_mask_checkbox.blockSignals(True)
+                self.use_fixed_mask_checkbox.setChecked(self.use_fixed_mask)
+                self.use_fixed_mask_checkbox.blockSignals(False)
+            if hasattr(self, "mask_status_label"):
+                has_masks = any(isinstance(mask, np.ndarray) for mask in self.fixed_roi_masks)
+                if self.use_fixed_mask and has_masks:
+                    self.mask_status_label.setText("Mask: active")
+                elif has_masks:
+                    self.mask_status_label.setText("Mask: disabled")
+                else:
+                    self.mask_status_label.setText("Mask: none")
+
+            self.update_rect_list(preferred_row=self.selected_rect_idx)
+            self._sync_analysis_range_widgets()
+
+            if self.cap and self.cap.isOpened() and self.total_frames > 0:
+                target_frame = max(0, min(snapshot.current_frame_index, self.total_frames - 1))
+                self.frame_slider.blockSignals(True)
+                self.frame_spinbox.blockSignals(True)
+                self.frame_slider.setValue(target_frame)
+                self.frame_spinbox.setValue(target_frame)
+                self.frame_slider.blockSignals(False)
+                self.frame_spinbox.blockSignals(False)
+                self._seek_to_frame(target_frame)
+            else:
+                self.current_frame_index = snapshot.current_frame_index
+                self.update_frame_label(reset=self.total_frames == 0)
+                self._sync_analysis_range_widgets()
+
+            self._update_current_brightness_display()
+            self.show_frame()
+        finally:
+            self._history_restoring = False
+
+    def undo_last_action(self):
+        """Restore the editor state before the last recorded change."""
+        if not self._undo_history:
+            return
+        entry = self._undo_history.pop()
+        self._redo_history.append(entry)
+        self._restore_editor_snapshot(entry.before)
+        self.statusBar().showMessage(f"Undid: {entry.label}", 3000)
+        self._update_history_actions()
+
+    def redo_last_action(self):
+        """Reapply the most recently undone change."""
+        if not self._redo_history:
+            return
+        entry = self._redo_history.pop()
+        self._undo_history.append(entry)
+        self._restore_editor_snapshot(entry.after)
+        self.statusBar().showMessage(f"Redid: {entry.label}", 3000)
+        self._update_history_actions()
+
+    def _cancel_active_worker(self):
+        """Request cancellation of any currently running worker."""
+        cancelled_any = False
+        if self._analysis_worker is not None:
+            self._analysis_worker.cancel()
+            cancelled_any = True
+        if self._audio_worker is not None:
+            self._audio_worker.cancel()
+            cancelled_any = True
+        if self._mask_worker is not None and hasattr(self._mask_worker, "cancel"):
+            self._mask_worker.cancel()  # type: ignore[call-arg]
+            cancelled_any = True
+
+        if cancelled_any:
+            self.statusBar().showMessage("Cancelling background task...")
+            self.results_label.setText("Cancellation requested...")
+
+    def _show_shortcuts_dialog(self):
+        """Show keyboard shortcuts dialog."""
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle('Keyboard Shortcuts')
+        dialog.setModal(True)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        
+        shortcuts_text = """
+<h3>Playback Shortcuts:</h3>
+<b>Space:</b> Play/Pause video<br>
+
+<h3>Navigation Shortcuts:</h3>
+<b>Left/Right Arrow:</b> Previous/Next frame (or nudge selected ROI)<br>
+<b>Up/Down Arrow:</b> Nudge selected ROI up/down<br>
+<b>Shift + Arrows:</b> Large 10px nudge<br>
+<b>Backspace:</b> Previous frame<br>
+<b>Page Down/Up:</b> Jump 10 frames<br>
+<b>Home/End:</b> Go to first/last frame<br>
+
+<h3>Analysis Shortcuts:</h3>
+<b>F5:</b> Run analysis<br>
+<b>Ctrl+D:</b> Detect from audio<br>
+<b>Cmd/Ctrl+Z:</b> Undo last edit<br>
+<b>Cmd/Ctrl+Shift+Z or Ctrl+Y:</b> Redo last edit<br>
+
+<h3>ROI Shortcuts:</h3>
+<b>Delete:</b> Delete selected ROI<br>
+<b>Ctrl+Shift+D:</b> Duplicate selected ROI<br>
+<b>Ctrl+Alt+D:</b> Duplicate selected ROI multiple times<br>
+<b>Escape:</b> Cancel current action<br>
+
+<h3>File Shortcuts:</h3>
+<b>Ctrl+O:</b> Open video<br>
+<b>Ctrl+Q:</b> Exit application<br>
+        """
+        
+        label = QtWidgets.QLabel(shortcuts_text)
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        
+        close_btn = QtWidgets.QPushButton('Close')
+        close_btn.clicked.connect(dialog.close)
+        layout.addWidget(close_btn)
+        
+        dialog.exec_()
+
+    def _show_about_dialog(self):
+        """Show about dialog."""
+        QtWidgets.QMessageBox.about(self, 'About Brightness Sorcerer',
+            """<h2>Brightness Sorcerer v2.0</h2>
+            <p>Advanced video brightness analysis tool</p>
+            <p>Analyze brightness changes in video regions of interest (ROIs) 
+            with automatic detection and comprehensive plotting.</p>
+            <p><b>Features:</b></p>
+            <ul>
+            <li>Interactive ROI selection and editing</li>
+            <li>Automatic frame range detection</li>
+            <li>Statistical analysis with mean and median</li>
+            <li>High-quality plot generation</li>
+            <li>Frame caching for smooth navigation</li>
+            </ul>""")
+
+    def _show_audio_settings_dialog(self):
+        """Show audio settings dialog."""
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle('Audio Settings')
+        dialog.setModal(True)
+        dialog.resize(350, 200)
+        
+        layout = QtWidgets.QVBoxLayout(dialog)
+        
+        # Audio enabled checkbox
+        enabled_checkbox = QtWidgets.QCheckBox("Enable Audio Feedback")
+        enabled_checkbox.setChecked(self.audio_manager.enabled)
+        layout.addWidget(enabled_checkbox)
+        
+        # Volume slider
+        volume_group = QtWidgets.QGroupBox("Volume")
+        volume_layout = QtWidgets.QVBoxLayout(volume_group)
+        
+        volume_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        volume_slider.setRange(0, 100)
+        volume_slider.setValue(int(self.audio_manager.volume * 100))
+        volume_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
+        volume_slider.setTickInterval(25)
+        
+        volume_label = QtWidgets.QLabel(f"Volume: {int(self.audio_manager.volume * 100)}%")
+        
+        def update_volume_label(value):
+            volume_label.setText(f"Volume: {value}%")
+        
+        volume_slider.valueChanged.connect(update_volume_label)
+        
+        volume_layout.addWidget(volume_label)
+        volume_layout.addWidget(volume_slider)
+        layout.addWidget(volume_group)
+        
+        # Test button
+        test_layout = QtWidgets.QHBoxLayout()
+        test_btn = QtWidgets.QPushButton("Test Audio")
+        test_btn.clicked.connect(lambda: self.audio_manager.play_analysis_start())
+        test_layout.addWidget(test_btn)
+        test_layout.addStretch()
+        layout.addLayout(test_layout)
+        
+        # Buttons
+        button_layout = QtWidgets.QHBoxLayout()
+        ok_btn = QtWidgets.QPushButton("OK")
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        
+        button_layout.addStretch()
+        button_layout.addWidget(ok_btn)
+        button_layout.addWidget(cancel_btn)
+        layout.addLayout(button_layout)
+        
+        def accept_settings():
+            self.audio_manager.set_enabled(enabled_checkbox.isChecked())
+            self.audio_manager.set_volume(volume_slider.value() / 100.0)
+            self._save_settings()
+            dialog.accept()
+        
+        ok_btn.clicked.connect(accept_settings)
+        cancel_btn.clicked.connect(dialog.reject)
+        
+        dialog.exec_()
+
+    def _apply_stylesheet(self):
+        """Apply a modern, clean stylesheet to the application."""
+        self.setStyleSheet(f"""
+            QMainWindow {{
+                background-color: {COLOR_BACKGROUND};
+                color: {COLOR_FOREGROUND};
+                font-family: {DEFAULT_FONT_FAMILY};
+                font-size: 14px;
+            }}
+            QSplitter::handle {{ background: {COLOR_SECONDARY_LIGHT}; }}
+            QMenuBar {{
+                background-color: {COLOR_SECONDARY};
+                color: {COLOR_FOREGROUND};
+                border-bottom: 1px solid {COLOR_SECONDARY_LIGHT};
+            }}
+            QMenuBar::item {{
+                background: transparent;
+                padding: 4px 8px;
+            }}
+            QMenuBar::item:selected {{
+                background-color: {COLOR_ACCENT};
+            }}
+            QMenu {{
+                background-color: {COLOR_SECONDARY};
+                color: {COLOR_FOREGROUND};
+                border: 1px solid {COLOR_SECONDARY_LIGHT};
+            }}
+            QMenu::item:selected {{
+                background-color: {COLOR_ACCENT};
+            }}
+            QStatusBar {{
+                background-color: {COLOR_SECONDARY};
+                color: {COLOR_FOREGROUND};
+                border-top: 1px solid {COLOR_SECONDARY_LIGHT};
+            }}
+            QWidget {{
+                background-color: {COLOR_BACKGROUND};
+                color: {COLOR_FOREGROUND};
+                font-family: {DEFAULT_FONT_FAMILY};
+                font-size: 14px;
+            }}
+            QScrollArea, QScrollArea > QWidget > QWidget {{
+                background-color: {COLOR_BACKGROUND};
+            }}
+            QTabWidget::pane {{ border: 1px solid {COLOR_SECONDARY_LIGHT}; border-radius: 6px; }}
+            QTabBar::tab {{ padding: 6px 10px; }}
+            QLabel#titleLabel {{
+                font-size: 24px;
+                font-weight: bold;
+                color: {COLOR_ACCENT};
+                padding-bottom: 10px;
+                qproperty-alignment: AlignCenter;
+            }}
+            QLabel#imageLabel {{
+                border: 1px solid {COLOR_SECONDARY_LIGHT};
+                background: #1e1e1e;
+                border-radius: 6px;
+            }}
+            QLabel#resultsLabel {{
+                font-size: 13px;
+                color: {COLOR_INFO};
+                background: {COLOR_SECONDARY};
+                border-radius: 4px;
+                padding: 8px;
+                border: 1px solid {COLOR_SECONDARY_LIGHT};
+            }}
+            QLabel#brightnessDisplayLabel {{
+                font-size: 28px;
+                font-weight: bold;
+                border: 1px solid {COLOR_SECONDARY_LIGHT};
+                padding: 10px;
+                color: {COLOR_BRIGHTNESS_LABEL};
+                background: {COLOR_SECONDARY};
+                border-radius: 6px;
+                qproperty-alignment: AlignCenter;
+            }}
+            QLabel#statusLabel {{
+                font-size: 12px;
+                color: {COLOR_INFO};
+                padding: 4px;
+            }}
+            QGroupBox {{
+                border: 1px solid {COLOR_SECONDARY_LIGHT};
+                border-radius: 6px;
+                margin-top: 10px;
+                background: {COLOR_SECONDARY};
+                font-weight: bold;
+                font-size: 15px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 10px;
+                padding: 2px 5px;
+                color: {COLOR_ACCENT};
+                background-color: {COLOR_BACKGROUND};
+                border-radius: 3px;
+            }}
+            QPushButton {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_SECONDARY_LIGHT}, stop: 1 {COLOR_SECONDARY});
+                color: {COLOR_FOREGROUND};
+                border: 1px solid {COLOR_SECONDARY};
+                border-radius: 6px;
+                padding: 8px 15px;
+                font-size: 14px;
+                min-height: 20px;
+            }}
+            QPushButton:hover {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_ACCENT}, stop: 1 #3c82c4);
+                color: white;
+                border: 1px solid {COLOR_ACCENT_HOVER};
+                padding: 8px 15px;
+            }}
+            QPushButton:pressed {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 #3170a8, stop: 1 {COLOR_ACCENT});
+                padding: 8px 15px;
+                border: 1px solid {COLOR_ACCENT};
+            }}
+            QPushButton:disabled {{
+                background: {COLOR_SECONDARY};
+                color: #888888;
+                border: 1px solid {COLOR_SECONDARY};
+            }}
+            QToolButton {{
+                background: {COLOR_SECONDARY};
+                color: {COLOR_FOREGROUND};
+                border: 1px solid {COLOR_SECONDARY_LIGHT};
+                border-radius: 6px;
+                padding: 6px 10px;
+                min-height: 18px;
+            }}
+            QToolButton:hover {{
+                background: {COLOR_SECONDARY_LIGHT};
+                border: 1px solid {COLOR_ACCENT};
+                color: white;
+            }}
+            QToolButton:disabled {{
+                background: {COLOR_SECONDARY};
+                color: #888888;
+                border: 1px solid {COLOR_SECONDARY};
+            }}
+            QPushButton:checked {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_ACCENT}, stop: 1 #3c82c4);
+                color: white;
+                border: 1px solid {COLOR_ACCENT_HOVER};
+            }}
+            QListWidget {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_BACKGROUND}, stop: 1 {COLOR_SECONDARY});
+                border: 1px solid {COLOR_SECONDARY_LIGHT};
+                color: {COLOR_FOREGROUND};
+                font-size: 13px;
+                border-radius: 6px;
+                padding: 4px;
+            }}
+            QListWidget::item {{
+                border-radius: 4px;
+                padding: 4px 8px;
+                margin: 1px;
+            }}
+            QListWidget::item:hover {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_SECONDARY_LIGHT}, stop: 1 {COLOR_SECONDARY});
+                border: 1px solid {COLOR_ACCENT};
+            }}
+            QListWidget::item:selected {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_ACCENT}, stop: 1 #3c82c4);
+                color: white;
+                border: 1px solid {COLOR_ACCENT_HOVER};
+            }}
+            QListWidget::item:selected:hover {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_ACCENT_HOVER}, stop: 1 {COLOR_ACCENT});
+            }}
+            QSlider::groove:horizontal {{
+                border: 1px solid {COLOR_SECONDARY};
+                height: 6px;
+                background: {COLOR_SECONDARY};
+                border-radius: 3px;
+            }}
+            QSlider::handle:horizontal {{
+                background: {COLOR_ACCENT};
+                border: 1px solid {COLOR_ACCENT_HOVER};
+                width: 16px;
+                margin: -5px 0;
+                border-radius: 8px;
+            }}
+            QSlider::sub-page:horizontal {{
+                background: {COLOR_SUCCESS};
+                border-radius: 3px;
+            }}
+            QSlider::add-page:horizontal {{
+                background: {COLOR_SECONDARY};
+                border-radius: 3px;
+            }}
+            QLineEdit, QSpinBox {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_BACKGROUND}, stop: 1 {COLOR_SECONDARY});
+                border: 1px solid {COLOR_SECONDARY_LIGHT};
+                padding: 6px 8px;
+                border-radius: 6px;
+                min-height: 20px;
+                color: {COLOR_FOREGROUND};
+            }}
+            QLineEdit:hover, QSpinBox:hover {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_SECONDARY}, stop: 1 {COLOR_SECONDARY_LIGHT});
+                border: 1px solid {COLOR_ACCENT};
+            }}
+            QLineEdit:focus, QSpinBox:focus {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 white, stop: 1 #f8f9fa);
+                border: 2px solid {COLOR_ACCENT};
+                color: #1a1a1a;
+                padding: 5px 7px;
+            }}
+            QSpinBox::up-button, QSpinBox::down-button {{
+                subcontrol-origin: border;
+                width: 16px;
+                border-left: 1px solid {COLOR_SECONDARY_LIGHT};
+                border-radius: 2px;
+            }}
+            QSpinBox::up-button {{
+                subcontrol-position: top right;
+            }}
+            QSpinBox::down-button {{
+                subcontrol-position: bottom right;
+            }}
+            /* Default platform-provided spin box arrows (no custom icons). */
+            QProgressDialog {{
+                 font-size: 14px;
+            }}
+            QProgressDialog QLabel {{
+                 color: {COLOR_FOREGROUND};
+            }}
+            QProgressBar {{
+                border: 1px solid {COLOR_SECONDARY_LIGHT};
+                border-radius: 4px;
+                text-align: center;
+                color: {COLOR_FOREGROUND};
+            }}
+            QProgressBar::chunk {{
+                background-color: {COLOR_SUCCESS};
+                border-radius: 3px;
+            }}
+
+            /* Modern Video Control Styling */
+            QPushButton#playButton {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_ACCENT}, stop: 1 #3c82c4);
+                color: white;
+                border: 2px solid {COLOR_ACCENT_HOVER};
+                border-radius: 20px;
+                font-size: 16px;
+                font-weight: bold;
+                min-width: 44px;
+                min-height: 36px;
+            }}
+            QPushButton#playButton:hover {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_ACCENT_HOVER}, stop: 1 {COLOR_ACCENT});
+                border: 2px solid #8fc8ff;
+            }}
+            QPushButton#playButton:pressed {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 #3170a8, stop: 1 {COLOR_ACCENT});
+                border: 2px solid {COLOR_ACCENT};
+            }}
+
+            QPushButton#mediaButton {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_SECONDARY_LIGHT}, stop: 1 {COLOR_SECONDARY});
+                color: {COLOR_FOREGROUND};
+                border: 1px solid {COLOR_SECONDARY_LIGHT};
+                border-radius: 20px;
+                font-size: 14px;
+                font-weight: bold;
+                min-width: 36px;
+                min-height: 36px;
+            }}
+            QPushButton#mediaButton:hover {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_ACCENT}, stop: 1 #3c82c4);
+                color: white;
+                border: 1px solid {COLOR_ACCENT_HOVER};
+            }}
+            QPushButton#mediaButton:pressed {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 #3170a8, stop: 1 {COLOR_ACCENT});
+            }}
+
+            QPushButton#jumpButton {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_SECONDARY_LIGHT}, stop: 1 {COLOR_SECONDARY});
+                color: {COLOR_FOREGROUND};
+                border: 1px solid {COLOR_SECONDARY_LIGHT};
+                border-radius: 6px;
+                font-size: 12px;
+                font-weight: 500;
+                padding: 6px 12px;
+            }}
+            QPushButton#jumpButton:hover {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_INFO}, stop: 1 #059aa8);
+                color: white;
+                border: 1px solid {COLOR_INFO};
+            }}
+
+            QPushButton#analysisButton {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_SECONDARY_LIGHT}, stop: 1 {COLOR_SECONDARY});
+                color: {COLOR_FOREGROUND};
+                border: 1px solid {COLOR_SECONDARY_LIGHT};
+                border-radius: 6px;
+                font-size: 12px;
+                font-weight: 500;
+                padding: 6px 12px;
+            }}
+            QPushButton#analysisButton:hover {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_SUCCESS}, stop: 1 #0d9488);
+                color: white;
+                border: 1px solid {COLOR_SUCCESS};
+            }}
+
+            QSlider#timelineSlider::groove:horizontal {{
+                border: none;
+                height: 8px;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_SECONDARY}, stop: 1 {COLOR_BACKGROUND});
+                border-radius: 4px;
+            }}
+            QSlider#timelineSlider::handle:horizontal {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 white, stop: 1 {COLOR_ACCENT});
+                border: 2px solid {COLOR_ACCENT_HOVER};
+                width: 20px;
+                margin: -8px 0;
+                border-radius: 10px;
+            }}
+            QSlider#timelineSlider::handle:horizontal:hover {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 white, stop: 1 {COLOR_ACCENT_HOVER});
+                border: 2px solid #8fc8ff;
+                width: 24px;
+                margin: -10px 0;
+            }}
+            QSlider#timelineSlider::sub-page:horizontal {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_SUCCESS}, stop: 1 #059669);
+                border-radius: 4px;
+            }}
+
+            /* Enhanced ComboBox Styling */
+            QComboBox {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_SECONDARY_LIGHT}, stop: 1 {COLOR_SECONDARY});
+                border: 1px solid {COLOR_SECONDARY_LIGHT};
+                border-radius: 4px;
+                padding: 4px 8px;
+                min-height: 20px;
+                color: {COLOR_FOREGROUND};
+            }}
+            QComboBox:hover {{
+                border: 1px solid {COLOR_ACCENT};
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_ACCENT}, stop: 1 #3c82c4);
+                color: white;
+            }}
+            QComboBox::drop-down {{
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 20px;
+                border-left: 1px solid {COLOR_SECONDARY_LIGHT};
+            }}
+            QComboBox::down-arrow {{
+                width: 0;
+                height: 0;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 6px solid {COLOR_FOREGROUND};
+                margin: 0px 6px;
+            }}
+            QComboBox:hover::down-arrow {{
+                border-top: 6px solid white;
+            }}
+
+            /* Enhanced Frame Separator */
+            QFrame[frameShape="5"] {{ /* VLine */
+                color: {COLOR_SECONDARY_LIGHT};
+                background-color: {COLOR_SECONDARY_LIGHT};
+                max-width: 1px;
+                margin: 4px 8px;
+            }}
+
+            /* Improved GroupBox styling */
+            QGroupBox {{
+                border: 2px solid {COLOR_SECONDARY_LIGHT};
+                border-radius: 8px;
+                margin-top: 12px;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_SECONDARY}, stop: 1 {COLOR_BACKGROUND});
+                font-weight: bold;
+                font-size: 14px;
+                padding-top: 12px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 12px;
+                padding: 4px 8px;
+                color: {COLOR_ACCENT};
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_BACKGROUND}, stop: 1 {COLOR_SECONDARY});
+                border: 1px solid {COLOR_ACCENT};
+                border-radius: 4px;
+            }}
+
+            /* Primary Button Styles */
+            QPushButton#primaryButton {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_ACCENT}, stop: 1 #3c82c4);
+                color: white;
+                border: 1px solid {COLOR_ACCENT_HOVER};
+                border-radius: 6px;
+                font-size: 14px;
+                font-weight: bold;
+                padding: 8px 16px;
+                min-height: 28px;
+            }}
+            QPushButton#primaryButton:hover {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_ACCENT_HOVER}, stop: 1 {COLOR_ACCENT});
+                border: 1px solid #8fc8ff;
+            }}
+            QPushButton#primaryButton:pressed {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 #3170a8, stop: 1 {COLOR_ACCENT});
+            }}
+
+            QPushButton#primaryActionButton {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_SUCCESS}, stop: 1 #059669);
+                color: white;
+                border: 2px solid {COLOR_SUCCESS};
+                border-radius: 8px;
+                font-size: 16px;
+                font-weight: bold;
+                padding: 10px 20px;
+                min-height: 32px;
+            }}
+            QPushButton#primaryActionButton:hover {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 #22c55e, stop: 1 {COLOR_SUCCESS});
+                border: 2px solid #22c55e;
+                transform: scale(1.02);
+            }}
+            QPushButton#primaryActionButton:pressed {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 #15803d, stop: 1 #059669);
+            }}
+            QPushButton#primaryActionButton:disabled {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                           stop: 0 {COLOR_SECONDARY}, stop: 1 {COLOR_BACKGROUND});
+                color: #888888;
+                border: 2px solid {COLOR_SECONDARY};
+            }}
+        """)
+
+    def _create_layouts(self):
+        """Create resizable panes with a splitter and add scrollable side panel."""
+        # Main horizontal splitter between left (video + controls) and right (side panel)
+        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.main_layout.addWidget(self.splitter)
+
+        # Left container widget (keeps existing left_layout semantics)
+        self.left_container = QtWidgets.QWidget()
+        self.left_layout = QtWidgets.QVBoxLayout(self.left_container)
+        self.left_layout.setContentsMargins(0, 0, 0, 0)
+        self.left_layout.setSpacing(8)
+        self.splitter.addWidget(self.left_container)
+
+        # Right container inside a scroll area (prevents off‑screen controls)
+        self.right_scroll = QtWidgets.QScrollArea()
+        self.right_scroll.setWidgetResizable(True)
+        self.right_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.right_content = QtWidgets.QWidget()
+        self.right_layout = QtWidgets.QVBoxLayout(self.right_content)
+        self.right_layout.setContentsMargins(8, 8, 8, 8)
+        self.right_layout.setSpacing(10)
+        self.right_scroll.setWidget(self.right_content)
+        self.splitter.addWidget(self.right_scroll)
+
+        # Enhanced responsive sizing
+        self.splitter.setStretchFactor(0, 3)
+        self.splitter.setStretchFactor(1, 1)
+        self.right_scroll.setMinimumWidth(360)
+        self.right_scroll.setMaximumWidth(560)
+
+        # Prevent either pane from collapsing to zero
+        self.splitter.setCollapsible(0, False)
+        self.splitter.setCollapsible(1, False)
+
+        # Set minimum size for main window to ensure usability
+        self.setMinimumSize(800, 600)
+
+    def _set_default_splitter_sizes(self):
+        """Set responsive splitter sizes based on current window width and screen size."""
+        try:
+            total = max(1, self.width())
+
+            # Adaptive split ratio based on window size
+            if total <= 1000:
+                # Smaller screens: give more space to video
+                ratio = 0.72
+            elif total <= 1400:
+                # Medium screens: balanced layout
+                ratio = 0.68
+            else:
+                # Large screens: slightly more space for side panel
+                ratio = 0.65
+
+            left = int(total * ratio)
+            right = max(360, min(560, total - left))  # Clamp right panel size
+            self.splitter.setSizes([left, right])
+        except Exception:
+            # Fallback sizes for different screen types
+            total = max(1, self.width())
+            if total <= 1000:
+                self.splitter.setSizes([700, 360])
+            else:
+                self.splitter.setSizes([900, 420])
+
+    def _create_widgets(self):
+        """Create all the widgets and add them to layouts."""
+        # --- Left Layout Widgets ---
+        # Header section with improved spacing
+        header_layout = QtWidgets.QVBoxLayout()
+        header_layout.setSpacing(8)
+        header_layout.setContentsMargins(8, 8, 8, 16)
+
+        self.title_label = QtWidgets.QLabel("Brightness Sorcerer", self)
+        self.title_label.setObjectName("titleLabel")
+        header_layout.addWidget(self.title_label)
+
+        # File info label
+        self.file_info_label = QtWidgets.QLabel("No video loaded")
+        self.file_info_label.setObjectName("statusLabel")
+        header_layout.addWidget(self.file_info_label)
+
+        # Open-file button with better styling
+        self.open_btn = QtWidgets.QPushButton("📁 Open Video… (Ctrl+O)")
+        self.open_btn.setObjectName("primaryButton")
+        self.open_btn.setToolTip("Choose a video file from disk")
+        self.open_btn.setFixedHeight(36)
+        header_layout.addWidget(self.open_btn)
+
+        self.left_layout.addLayout(header_layout)
+
+        self.image_label = QtWidgets.QLabel(self)
+        self.image_label.setObjectName("imageLabel")
+        self.image_label.setAlignment(QtCore.Qt.AlignCenter)
+        # Let image scale down responsively but not push controls off-screen
+        self.image_label.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.image_label.setMinimumHeight(240)
+        self.image_label.setText("Drag & Drop Video File Here")
+        self.left_layout.addWidget(self.image_label, stretch=1)
+
+        # Modern Video Controls with consolidated layout
+        self.video_controls_groupbox = QtWidgets.QGroupBox("Video Controls")
+        controls_layout = QtWidgets.QVBoxLayout()
+        controls_layout.setContentsMargins(12, 16, 12, 16)
+        controls_layout.setSpacing(12)
+
+        # Main Timeline Row - consolidated playback controls
+        main_timeline_layout = QtWidgets.QHBoxLayout()
+        main_timeline_layout.setSpacing(8)
+
+        # Previous frame button
+        self.prev_frame_btn = QtWidgets.QPushButton("⏮")
+        self.prev_frame_btn.setToolTip("Previous Frame (Left Arrow)")
+        self.prev_frame_btn.setFixedSize(40, 40)
+        self.prev_frame_btn.setObjectName("mediaButton")
+        main_timeline_layout.addWidget(self.prev_frame_btn)
+
+        # Play/Pause button - larger and more prominent
+        self.play_pause_btn = QtWidgets.QPushButton("⏵")
+        self.play_pause_btn.setToolTip("Play/Pause video (Spacebar)")
+        self.play_pause_btn.setFixedSize(48, 40)
+        self.play_pause_btn.setObjectName("playButton")
+        main_timeline_layout.addWidget(self.play_pause_btn)
+
+        # Next frame button
+        self.next_frame_btn = QtWidgets.QPushButton("⏭")
+        self.next_frame_btn.setToolTip("Next Frame (Right Arrow)")
+        self.next_frame_btn.setFixedSize(40, 40)
+        self.next_frame_btn.setObjectName("mediaButton")
+        main_timeline_layout.addWidget(self.next_frame_btn)
+
+        # Timeline slider with frame info
+        timeline_container = QtWidgets.QVBoxLayout()
+        timeline_container.setSpacing(4)
+
+        # Frame slider (main timeline)
+        self.frame_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.frame_slider.setToolTip("Drag to navigate frames or click to seek")
+        self.frame_slider.setMinimumHeight(24)
+        self.frame_slider.setObjectName("timelineSlider")
+        timeline_container.addWidget(self.frame_slider)
+
+        self.analysis_range_slider = AnalysisRangeSlider(self)
+        self.analysis_range_slider.setToolTip("Drag the handles to adjust the analysis start and end frames")
+        timeline_container.addWidget(self.analysis_range_slider)
+
+        range_summary_layout = QtWidgets.QHBoxLayout()
+        range_summary_layout.setSpacing(8)
+        self.analysis_range_summary_label = QtWidgets.QLabel("Analysis Window: full video")
+        self.analysis_range_summary_label.setMinimumWidth(240)
+        range_summary_layout.addWidget(self.analysis_range_summary_label)
+        range_summary_layout.addStretch()
+        timeline_container.addLayout(range_summary_layout)
+
+        range_editor_layout = QtWidgets.QHBoxLayout()
+        range_editor_layout.setSpacing(6)
+        range_editor_layout.addWidget(QtWidgets.QLabel("Start"))
+        self.range_start_spinbox = QtWidgets.QSpinBox()
+        self.range_start_spinbox.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+        self.range_start_spinbox.setAlignment(QtCore.Qt.AlignCenter)
+        self.range_start_spinbox.setToolTip("Analysis start frame (1-based)")
+        self.range_start_spinbox.setFixedWidth(84)
+        range_editor_layout.addWidget(self.range_start_spinbox)
+
+        self.range_start_current_btn = QtWidgets.QToolButton()
+        self.range_start_current_btn.setText("Current")
+        self.range_start_current_btn.setToolTip("Use the current frame as the analysis start")
+        range_editor_layout.addWidget(self.range_start_current_btn)
+
+        range_editor_layout.addWidget(QtWidgets.QLabel("End"))
+        self.range_end_spinbox = QtWidgets.QSpinBox()
+        self.range_end_spinbox.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+        self.range_end_spinbox.setAlignment(QtCore.Qt.AlignCenter)
+        self.range_end_spinbox.setToolTip("Analysis end frame (1-based)")
+        self.range_end_spinbox.setFixedWidth(84)
+        range_editor_layout.addWidget(self.range_end_spinbox)
+
+        self.range_end_current_btn = QtWidgets.QToolButton()
+        self.range_end_current_btn.setText("Current")
+        self.range_end_current_btn.setToolTip("Use the current frame as the analysis end")
+        range_editor_layout.addWidget(self.range_end_current_btn)
+
+        self.range_full_btn = QtWidgets.QToolButton()
+        self.range_full_btn.setText("Full Video")
+        self.range_full_btn.setToolTip("Reset the analysis range to the full video")
+        range_editor_layout.addWidget(self.range_full_btn)
+        range_editor_layout.addStretch()
+        timeline_container.addLayout(range_editor_layout)
+
+        # Frame info row
+        frame_info_layout = QtWidgets.QHBoxLayout()
+        frame_info_layout.setSpacing(8)
+
+        self.frame_label = QtWidgets.QLabel("Frame: 0 / 0")
+        self.frame_label.setMinimumWidth(120)
+        self.frame_label.setAlignment(QtCore.Qt.AlignLeft)
+        frame_info_layout.addWidget(self.frame_label)
+
+        frame_info_layout.addStretch()
+
+        # Frame input
+        frame_input_layout = QtWidgets.QHBoxLayout()
+        frame_input_layout.setSpacing(4)
+        frame_input_layout.addWidget(QtWidgets.QLabel("Go to:"))
+        self.frame_spinbox = QtWidgets.QSpinBox()
+        self.frame_spinbox.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+        self.frame_spinbox.setToolTip("Enter frame number directly")
+        self.frame_spinbox.setAlignment(QtCore.Qt.AlignCenter)
+        self.frame_spinbox.setFixedWidth(80)
+        frame_input_layout.addWidget(self.frame_spinbox)
+
+        frame_info_layout.addLayout(frame_input_layout)
+        timeline_container.addLayout(frame_info_layout)
+
+        main_timeline_layout.addLayout(timeline_container)
+
+        # Speed control - compact design
+        speed_container = QtWidgets.QVBoxLayout()
+        speed_container.setSpacing(4)
+        speed_label = QtWidgets.QLabel("Speed")
+        speed_label.setAlignment(QtCore.Qt.AlignCenter)
+        speed_container.addWidget(speed_label)
+        self.speed_combo = QtWidgets.QComboBox()
+        self.speed_combo.addItems(["0.25×", "0.5×", "1×", "2×", "4×"])
+        self.speed_combo.setCurrentText("1×")
+        self.speed_combo.setToolTip("Playback speed")
+        self.speed_combo.setFixedWidth(60)
+        speed_container.addWidget(self.speed_combo)
+        main_timeline_layout.addLayout(speed_container)
+
+        controls_layout.addLayout(main_timeline_layout)
+
+        # Secondary Controls Row - Jump and Analysis
+        secondary_layout = QtWidgets.QHBoxLayout()
+        secondary_layout.setSpacing(12)
+
+        # Jump controls group
+        jump_group = QtWidgets.QHBoxLayout()
+        jump_group.setSpacing(6)
+
+        self.jump_back_btn = QtWidgets.QPushButton(f"⏪ {JUMP_FRAMES}")
+        self.jump_back_btn.setToolTip(f"Jump back {JUMP_FRAMES} frames (Page Up)")
+        self.jump_back_btn.setFixedHeight(32)
+        self.jump_back_btn.setObjectName("jumpButton")
+        jump_group.addWidget(self.jump_back_btn)
+
+        self.jump_forward_btn = QtWidgets.QPushButton(f"{JUMP_FRAMES} ⏩")
+        self.jump_forward_btn.setToolTip(f"Jump forward {JUMP_FRAMES} frames (Page Down)")
+        self.jump_forward_btn.setFixedHeight(32)
+        self.jump_forward_btn.setObjectName("jumpButton")
+        jump_group.addWidget(self.jump_forward_btn)
+
+        secondary_layout.addLayout(jump_group)
+
+        # Separator
+        separator = QtWidgets.QFrame()
+        separator.setFrameShape(QtWidgets.QFrame.VLine)
+        separator.setFrameShadow(QtWidgets.QFrame.Sunken)
+        secondary_layout.addWidget(separator)
+
+        # Analysis controls group
+        analysis_group = QtWidgets.QHBoxLayout()
+        analysis_group.setSpacing(6)
+
+        self.undo_btn = QtWidgets.QPushButton("Undo")
+        self.undo_btn.setToolTip("Undo the last editor change")
+        self.undo_btn.setFixedHeight(32)
+        self.undo_btn.setObjectName("analysisButton")
+        analysis_group.addWidget(self.undo_btn)
+
+        self.redo_btn = QtWidgets.QPushButton("Redo")
+        self.redo_btn.setToolTip("Redo the most recently undone change")
+        self.redo_btn.setFixedHeight(32)
+        self.redo_btn.setObjectName("analysisButton")
+        analysis_group.addWidget(self.redo_btn)
+
+        self.auto_detect_btn = QtWidgets.QPushButton("🎵 Detect from Audio")
+        self.auto_detect_btn.setToolTip("Detect completion beeps in audio and calculate frame ranges (Ctrl+D)")
+        self.auto_detect_btn.setFixedHeight(32)
+        self.auto_detect_btn.setObjectName("analysisButton")
+        analysis_group.addWidget(self.auto_detect_btn)
+
+        secondary_layout.addLayout(analysis_group)
+        secondary_layout.addStretch()
+
+        controls_layout.addLayout(secondary_layout)
+        
+        self.video_controls_groupbox.setLayout(controls_layout)
+        # Keep controls compact to avoid crowding
+        self.video_controls_groupbox.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+        self.video_controls_groupbox.setMaximumHeight(285)
+        self.left_layout.addWidget(self.video_controls_groupbox)
+
+        # Analysis Section with improved grouping and spacing
+        analysis_section = QtWidgets.QVBoxLayout()
+        analysis_section.setSpacing(12)
+        analysis_section.setContentsMargins(8, 16, 8, 8)
+
+        # Analysis Name Layout with better spacing
+        name_layout = QtWidgets.QHBoxLayout()
+        name_layout.setSpacing(8)
+        name_label = QtWidgets.QLabel("Analysis Name:")
+        name_label.setMinimumWidth(100)
+        name_layout.addWidget(name_label)
+        self.analysis_name_input = QtWidgets.QLineEdit()
+        self.analysis_name_input.setPlaceholderText("DefaultAnalysis")
+        self.analysis_name_input.setFixedHeight(32)
+        name_layout.addWidget(self.analysis_name_input)
+        analysis_section.addLayout(name_layout)
+
+        # Action Buttons Layout with prominent styling
+        action_layout = QtWidgets.QHBoxLayout()
+        self.analyze_btn = QtWidgets.QPushButton('🔍 Analyze Brightness (F5)')
+        self.analyze_btn.setObjectName("primaryActionButton")
+        self.analyze_btn.setToolTip("Run brightness analysis on the selected frame range and ROIs")
+        self.analyze_btn.setFixedHeight(40)
+        action_layout.addWidget(self.analyze_btn)
+        analysis_section.addLayout(action_layout)
+
+        self.left_layout.addLayout(analysis_section)
+
+        # --- Right Panel Widgets (not yet added to layout; placed into tabs below) ---
+        # Video info group
+        self.video_info_groupbox = QtWidgets.QGroupBox("Video Information")
+        video_info_layout = QtWidgets.QVBoxLayout()
+        self.video_info_label = QtWidgets.QLabel("No video loaded")
+        self.video_info_label.setWordWrap(True)
+        video_info_layout.addWidget(self.video_info_label)
+        self.video_info_groupbox.setLayout(video_info_layout)
+
+        # Brightness Display
+        self.brightness_groupbox = QtWidgets.QGroupBox("ROI Brightness: Mean±Median (Current Frame)")
+        brightness_groupbox_layout = QtWidgets.QVBoxLayout()
+        self.brightness_display_label = QtWidgets.QLabel("N/A")
+        self.brightness_display_label.setObjectName("brightnessDisplayLabel")
+        brightness_groupbox_layout.addWidget(self.brightness_display_label)
+        self.brightness_groupbox.setLayout(brightness_groupbox_layout)
+
+        # -- Run Duration Settings
+        self.run_duration_groupbox = QtWidgets.QGroupBox("Run Duration (Optional)")
+        run_duration_layout = QtWidgets.QVBoxLayout()
+        
+        duration_input_layout = QtWidgets.QHBoxLayout()
+        duration_input_layout.addWidget(QtWidgets.QLabel("Expected Duration (sec):"))
+        self.run_duration_spin = QtWidgets.QDoubleSpinBox()
+        self.run_duration_spin.setDecimals(1)
+        self.run_duration_spin.setRange(0.0, 3600.0)  # 0 to 1 hour
+        self.run_duration_spin.setSingleStep(0.5)
+        self.run_duration_spin.setValue(0.0)  # 0 = disabled
+        self.run_duration_spin.setToolTip("Expected run duration for validation (0 = disabled)")
+        duration_input_layout.addWidget(self.run_duration_spin)
+        run_duration_layout.addLayout(duration_input_layout)
+
+        cache_input_layout = QtWidgets.QHBoxLayout()
+        cache_input_layout.addWidget(QtWidgets.QLabel("Frame Cache Size:"))
+        self.cache_size_spin = QtWidgets.QSpinBox()
+        self.cache_size_spin.setRange(10, 2000)
+        self.cache_size_spin.setSingleStep(10)
+        self.cache_size_spin.setValue(self.frame_cache_size)
+        self.cache_size_spin.setToolTip("Maximum number of decoded frames held in cache")
+        cache_input_layout.addWidget(self.cache_size_spin)
+        run_duration_layout.addLayout(cache_input_layout)
+        
+        self.run_duration_groupbox.setLayout(run_duration_layout)
+        self.right_layout.addWidget(self.run_duration_groupbox)
+
+        # -- Threshold groupbox
+        self.threshold_groupbox = QtWidgets.QGroupBox("Threshold Settings")
+        th_layout = QtWidgets.QVBoxLayout()
+        
+        # Manual threshold controls
+        manual_layout = QtWidgets.QHBoxLayout()
+        manual_layout.addWidget(QtWidgets.QLabel("Manual ΔL*:"))
+        self.threshold_spin = QtWidgets.QDoubleSpinBox()
+        self.threshold_spin.setDecimals(1)
+        self.threshold_spin.setRange(0.0, 100.0)
+        self.threshold_spin.setSingleStep(0.5)
+        self.threshold_spin.setValue(self.manual_threshold)
+        manual_layout.addWidget(self.threshold_spin)
+        th_layout.addLayout(manual_layout)
+        
+        # Background ROI controls
+        bg_layout = QtWidgets.QHBoxLayout()
+        self.set_bg_btn = QtWidgets.QPushButton("Use Selected ROI as Background")
+        bg_layout.addWidget(self.set_bg_btn)
+        th_layout.addLayout(bg_layout)
+        
+        # Current threshold display
+        self.threshold_display_label = QtWidgets.QLabel("Active Threshold: Manual (5.0 L*)")
+        self.threshold_display_label.setStyleSheet("color: #ffc000; font-weight: bold; padding: 4px;")
+        th_layout.addWidget(self.threshold_display_label)
+        
+        self.threshold_groupbox.setLayout(th_layout)
+
+        # Visualization Controls
+        self.viz_groupbox = QtWidgets.QGroupBox("Visualization")
+        viz_layout = QtWidgets.QVBoxLayout()
+        
+        self.show_mask_checkbox = QtWidgets.QCheckBox("Show Pixel Mask")
+        self.show_mask_checkbox.setToolTip("Highlight analyzed pixels in red overlay")
+        self.show_mask_checkbox.setChecked(self.show_pixel_mask)
+        viz_layout.addWidget(self.show_mask_checkbox)
+
+        # Fixed mask controls
+        self.use_fixed_mask_checkbox = QtWidgets.QCheckBox("Use Fixed Mask (from frame)")
+        self.use_fixed_mask_checkbox.setToolTip("Apply a pixel mask captured on a specific frame to all frames during analysis and visualization")
+        viz_layout.addWidget(self.use_fixed_mask_checkbox)
+
+        mask_btn_layout = QtWidgets.QGridLayout()
+        mask_btn_layout.setHorizontalSpacing(8)
+        mask_btn_layout.setVerticalSpacing(6)
+        self.capture_mask_btn = QtWidgets.QPushButton("Capture From Current")
+        self.capture_mask_btn.setToolTip("Compute the analyzed-pixel mask for each ROI based on the current frame and reuse it for all frames")
+        mask_btn_layout.addWidget(self.capture_mask_btn, 0, 0)
+
+        self.auto_brightest_mask_btn = QtWidgets.QPushButton("Auto (Global)")
+        self.auto_brightest_mask_btn.setToolTip("Find one brightest frame (averaged across all ROIs) and capture all masks from it")
+        mask_btn_layout.addWidget(self.auto_brightest_mask_btn, 0, 1)
+
+        self.per_roi_brightest_btn = QtWidgets.QPushButton("Auto (Per-ROI)")
+        self.per_roi_brightest_btn.setToolTip("Find the brightest frame for EACH ROI independently - best for sequential electrode activation")
+        mask_btn_layout.addWidget(self.per_roi_brightest_btn, 1, 0, 1, 2)
+        viz_layout.addLayout(mask_btn_layout)
+
+        self.mask_status_label = QtWidgets.QLabel("Mask: none")
+        self.mask_status_label.setObjectName("statusLabel")
+        viz_layout.addWidget(self.mask_status_label)
+
+        self.mask_pixel_count_label = QtWidgets.QLabel("Mask Pixels: n/a")
+        self.mask_pixel_count_label.setObjectName("statusLabel")
+        viz_layout.addWidget(self.mask_pixel_count_label)
+
+        # Noise filtering controls
+        noise_groupbox = QtWidgets.QGroupBox("Noise Filtering")
+        noise_layout = QtWidgets.QVBoxLayout()
+
+        # Morphological kernel size
+        kernel_layout = QtWidgets.QHBoxLayout()
+        kernel_layout.addWidget(QtWidgets.QLabel("Morphological Kernel:"))
+        self.kernel_size_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.kernel_size_slider.setRange(1, 15)
+        self.kernel_size_slider.setValue(self.morphological_kernel_size)
+        self.kernel_size_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
+        self.kernel_size_slider.setTickInterval(2)
+        self.kernel_size_label = QtWidgets.QLabel(f"{self.morphological_kernel_size}×{self.morphological_kernel_size}")
+        kernel_layout.addWidget(self.kernel_size_slider)
+        kernel_layout.addWidget(self.kernel_size_label)
+        noise_layout.addLayout(kernel_layout)
+
+        # Background percentile
+        bg_percentile_layout = QtWidgets.QHBoxLayout()
+        bg_percentile_layout.addWidget(QtWidgets.QLabel("Background Percentile:"))
+        self.bg_percentile_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.bg_percentile_slider.setRange(50, 99)
+        self.bg_percentile_slider.setValue(int(self.background_percentile))
+        self.bg_percentile_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
+        self.bg_percentile_slider.setTickInterval(10)
+        self.bg_percentile_label = QtWidgets.QLabel(f"{self.background_percentile:.0f}%")
+        bg_percentile_layout.addWidget(self.bg_percentile_slider)
+        bg_percentile_layout.addWidget(self.bg_percentile_label)
+        noise_layout.addLayout(bg_percentile_layout)
+
+        # Noise floor threshold
+        noise_floor_layout = QtWidgets.QHBoxLayout()
+        noise_floor_layout.addWidget(QtWidgets.QLabel("Noise Floor (L*):"))
+        self.noise_floor_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.noise_floor_slider.setRange(0, 20)
+        self.noise_floor_slider.setValue(int(self.noise_floor_threshold * 2))  # 0.5 precision
+        self.noise_floor_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
+        self.noise_floor_slider.setTickInterval(4)
+        self.noise_floor_label = QtWidgets.QLabel(f"{self.noise_floor_threshold:.1f}")
+        noise_floor_layout.addWidget(self.noise_floor_slider)
+        noise_floor_layout.addWidget(self.noise_floor_label)
+        noise_layout.addLayout(noise_floor_layout)
+
+        noise_groupbox.setLayout(noise_layout)
+        viz_layout.addWidget(noise_groupbox)
+
+        self.viz_groupbox.setLayout(viz_layout)
+
+        # Rectangle Controls
+        self.rect_groupbox = QtWidgets.QGroupBox("Regions of Interest (ROI)")
+        rect_groupbox_layout = QtWidgets.QVBoxLayout()
+        self.rect_list = QtWidgets.QListWidget()
+        self.rect_list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        rect_groupbox_layout.addWidget(self.rect_list)
+
+        rect_btn_layout = QtWidgets.QHBoxLayout()
+        rect_btn_layout.setSpacing(6)
+        self.add_rect_btn = QtWidgets.QPushButton("Add ROI")
+        self.add_rect_btn.setCheckable(True)
+        self.add_rect_btn.setToolTip("Click then draw a rectangle on the video frame")
+        rect_btn_layout.addWidget(self.add_rect_btn)
+
+        # Inline ROI-by-size row: width / height spinboxes + Add button
+        roi_size_layout = QtWidgets.QHBoxLayout()
+        roi_size_layout.setSpacing(4)
+        roi_size_label = QtWidgets.QLabel("Size:")
+        roi_size_layout.addWidget(roi_size_label)
+        self.roi_width_spin = QtWidgets.QSpinBox()
+        self.roi_width_spin.setRange(1, 9999)
+        self.roi_width_spin.setValue(100)
+        self.roi_width_spin.setSuffix(" W")
+        self.roi_width_spin.setToolTip("Width of the new ROI in pixels")
+        roi_size_layout.addWidget(self.roi_width_spin)
+        self.roi_height_spin = QtWidgets.QSpinBox()
+        self.roi_height_spin.setRange(1, 9999)
+        self.roi_height_spin.setValue(100)
+        self.roi_height_spin.setSuffix(" H")
+        self.roi_height_spin.setToolTip("Height of the new ROI in pixels")
+        roi_size_layout.addWidget(self.roi_height_spin)
+        self.add_sized_roi_btn = QtWidgets.QPushButton("Add")
+        self.add_sized_roi_btn.setToolTip("Add a new ROI with the specified width and height (centered in frame)")
+        roi_size_layout.addWidget(self.add_sized_roi_btn)
+
+        rect_btn_layout2a = QtWidgets.QHBoxLayout()
+        rect_btn_layout2a.setSpacing(6)
+        self.dup_rect_btn = QtWidgets.QPushButton("Duplicate ROI")
+        self.dup_rect_btn.setToolTip("Duplicate selected ROI with a small offset (Ctrl+Shift+D)")
+        rect_btn_layout2a.addWidget(self.dup_rect_btn)
+
+        self.dup_multi_rect_btn = QtWidgets.QPushButton("Duplicate xN...")
+        self.dup_multi_rect_btn.setToolTip("Duplicate selected ROI multiple times (Ctrl+Alt+D)")
+        rect_btn_layout2a.addWidget(self.dup_multi_rect_btn)
+
+        # Second row of buttons
+        rect_btn_layout2 = QtWidgets.QHBoxLayout()
+        rect_btn_layout2.setSpacing(6)
+        self.del_rect_btn = QtWidgets.QPushButton("Delete ROI")
+        self.del_rect_btn.setToolTip("Delete the selected ROI from the list (Delete key)")
+        rect_btn_layout2.addWidget(self.del_rect_btn)
+
+        self.clear_rect_btn = QtWidgets.QPushButton("Clear All")
+        self.clear_rect_btn.setToolTip("Remove all ROIs")
+        rect_btn_layout2.addWidget(self.clear_rect_btn)
+
+        self.set_bg_roi_btn = QtWidgets.QPushButton("Set as Background")
+        self.set_bg_roi_btn.setToolTip("Set the selected ROI as the background reference for threshold calculation")
+        rect_btn_layout2.addWidget(self.set_bg_roi_btn)
+
+        rect_groupbox_layout.addLayout(rect_btn_layout)
+        rect_groupbox_layout.addLayout(roi_size_layout)
+        rect_groupbox_layout.addLayout(rect_btn_layout2a)
+        rect_groupbox_layout.addLayout(rect_btn_layout2)
+        self.rect_groupbox.setLayout(rect_groupbox_layout)
+
+        # Export Controls
+        self.export_groupbox = QtWidgets.QGroupBox("Export Outputs")
+        export_layout = QtWidgets.QVBoxLayout()
+
+        self.export_csv_checkbox = QtWidgets.QCheckBox("CSV data")
+        self.export_csv_checkbox.setToolTip("Write frame-by-frame brightness measurements as .csv files")
+        self.export_csv_checkbox.setChecked(True)
+        export_layout.addWidget(self.export_csv_checkbox)
+
+        self.export_json_checkbox = QtWidgets.QCheckBox("JSON data")
+        self.export_json_checkbox.setToolTip("Write the same measurements and summary metadata as .json files")
+        self.export_json_checkbox.setChecked(False)
+        export_layout.addWidget(self.export_json_checkbox)
+
+        self.export_plot_checkbox = QtWidgets.QCheckBox("Static plot PNG")
+        self.export_plot_checkbox.setToolTip("Write the current enhanced static plot image for each ROI")
+        self.export_plot_checkbox.setChecked(True)
+        export_layout.addWidget(self.export_plot_checkbox)
+
+        self.export_interactive_checkbox = QtWidgets.QCheckBox("Interactive plot HTML")
+        self.export_interactive_checkbox.setToolTip("Write the interactive Plotly HTML plot for each ROI when Plotly is available")
+        self.export_interactive_checkbox.setChecked(True)
+        export_layout.addWidget(self.export_interactive_checkbox)
+
+        self.export_groupbox.setLayout(export_layout)
+
+        # Cache status
+        self.cache_status_label = QtWidgets.QLabel("Cache: 0 frames")
+        self.cache_status_label.setObjectName("statusLabel")
+
+        # Results/Status Label
+        self.results_label = QtWidgets.QLabel("Load a video to begin analysis.")
+        self.results_label.setObjectName("resultsLabel")
+        self.results_label.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
+        self.results_label.setWordWrap(True)
+        self.results_label.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Expanding)
+
+        # Organize right panel into tabs for clarity and prevent overflow with a scroll area (added in _create_layouts)
+        self.side_tabs = QtWidgets.QTabWidget()
+        self.side_tabs.setDocumentMode(True)
+        self.side_tabs.setTabPosition(QtWidgets.QTabWidget.North)
+        self.side_tabs.setMinimumWidth(380)
+
+        # Info tab
+        info_tab = QtWidgets.QWidget()
+        info_layout = QtWidgets.QVBoxLayout(info_tab)
+        info_layout.addWidget(self.video_info_groupbox)
+        info_layout.addWidget(self.brightness_groupbox)
+        info_layout.addWidget(self.cache_status_label)
+        info_layout.addStretch()
+        self.side_tabs.addTab(info_tab, "Info")
+
+        # Analysis tab
+        analysis_tab = QtWidgets.QWidget()
+        analysis_tab_layout = QtWidgets.QVBoxLayout(analysis_tab)
+        analysis_tab_layout.addWidget(self.run_duration_groupbox)
+        analysis_tab_layout.addWidget(self.threshold_groupbox)
+        analysis_tab_layout.addStretch()
+        self.side_tabs.addTab(analysis_tab, "Analysis")
+
+        # Visualization tab
+        viz_tab = QtWidgets.QWidget()
+        viz_tab_layout = QtWidgets.QVBoxLayout(viz_tab)
+        viz_tab_layout.addWidget(self.viz_groupbox)
+        viz_tab_layout.addStretch()
+        self.side_tabs.addTab(viz_tab, "Visualization")
+
+        # ROIs tab
+        roi_tab = QtWidgets.QWidget()
+        roi_tab_layout = QtWidgets.QVBoxLayout(roi_tab)
+        roi_tab_layout.addWidget(self.rect_groupbox)
+        roi_tab_layout.addStretch()
+        self.side_tabs.addTab(roi_tab, "ROIs")
+
+        # Export tab
+        self.export_tab = QtWidgets.QWidget()
+        export_tab_layout = QtWidgets.QVBoxLayout(self.export_tab)
+        export_tab_layout.addWidget(self.export_groupbox)
+        export_tab_layout.addStretch()
+        self.side_tabs.addTab(self.export_tab, "Export")
+
+        # Status tab
+        status_tab = QtWidgets.QWidget()
+        status_layout = QtWidgets.QVBoxLayout(status_tab)
+        status_layout.addWidget(self.results_label)
+        self.side_tabs.addTab(status_tab, "Status")
+
+        # Add the tab widget to the right layout (scroll area content)
+        self.right_layout.addWidget(self.side_tabs)
+
+        sidebar_buttons = [
+            self.set_bg_btn,
+            self.capture_mask_btn,
+            self.auto_brightest_mask_btn,
+            self.per_roi_brightest_btn,
+            self.add_rect_btn,
+            self.add_sized_roi_btn,
+            self.dup_rect_btn,
+            self.dup_multi_rect_btn,
+            self.del_rect_btn,
+            self.clear_rect_btn,
+            self.set_bg_roi_btn,
+        ]
+        for button in sidebar_buttons:
+            button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+            button.setMinimumHeight(34)
+
+    def _connect_signals(self):
+        """Connect widget signals to their corresponding slots."""
+        self.open_btn.clicked.connect(self.open_video_dialog)
+
+        self.frame_slider.valueChanged.connect(self.slider_frame_changed)
+        self.frame_spinbox.valueChanged.connect(self.spinbox_frame_changed)
+        self.analysis_range_slider.rangeEditStarted.connect(
+            lambda: self._begin_history_action("Adjust Analysis Window")
+        )
+        self.analysis_range_slider.rangeChanged.connect(self._on_analysis_range_slider_changed)
+        self.analysis_range_slider.rangeEditFinished.connect(self._commit_history_action)
+        self.range_start_spinbox.valueChanged.connect(self._on_range_start_spinbox_changed)
+        self.range_end_spinbox.valueChanged.connect(self._on_range_end_spinbox_changed)
+        self.range_start_current_btn.clicked.connect(self.set_start_frame)
+        self.range_end_current_btn.clicked.connect(self.set_end_frame)
+        self.range_full_btn.clicked.connect(self.reset_analysis_range_to_full_video)
+
+        self.prev_frame_btn.clicked.connect(lambda: self.step_frames(-1))
+        self.next_frame_btn.clicked.connect(lambda: self.step_frames(1))
+        self.jump_back_btn.clicked.connect(lambda: self.step_frames(-JUMP_FRAMES))
+        self.jump_forward_btn.clicked.connect(lambda: self.step_frames(JUMP_FRAMES))
+        self.undo_btn.clicked.connect(self.undo_last_action)
+        self.redo_btn.clicked.connect(self.redo_last_action)
+        self.auto_detect_btn.clicked.connect(self.auto_detect_range)
+        
+        # Playback controls
+        self.play_pause_btn.clicked.connect(self.toggle_playback)
+        self.speed_combo.currentTextChanged.connect(self.on_speed_changed)
+        self.playback_timer.timeout.connect(self.advance_frame)
+
+        self.analyze_btn.clicked.connect(self.analyze_video)
+
+        self.rect_list.currentRowChanged.connect(self.select_rectangle_from_list)
+        self.add_rect_btn.clicked.connect(self.toggle_add_rectangle_mode)
+        self.add_sized_roi_btn.clicked.connect(self.add_roi_by_size)
+        self.dup_rect_btn.clicked.connect(self.duplicate_selected_rectangle)
+        self.dup_multi_rect_btn.clicked.connect(self.duplicate_selected_rectangle_multiple)
+        self.del_rect_btn.clicked.connect(self.delete_selected_rectangle)
+        self.clear_rect_btn.clicked.connect(self.clear_all_rectangles)
+        self.set_bg_roi_btn.clicked.connect(self._set_background_roi)
+
+        # Connect mouse events directly
+        self.image_label.mousePressEvent = self.image_mouse_press
+        self.image_label.mouseMoveEvent = self.image_mouse_move
+        self.image_label.mouseReleaseEvent = self.image_mouse_release
+
+        self.threshold_spin.valueChanged.connect(self._on_threshold_changed)
+        self.set_bg_btn.clicked.connect(self._set_background_roi)
+        self.show_mask_checkbox.toggled.connect(self._on_mask_checkbox_toggled)
+        self.use_fixed_mask_checkbox.toggled.connect(self._on_use_fixed_mask_toggled)
+        self.capture_mask_btn.clicked.connect(self._capture_fixed_masks)
+        self.auto_brightest_mask_btn.clicked.connect(self._auto_capture_brightest_frame_masks)
+        self.per_roi_brightest_btn.clicked.connect(self._auto_capture_per_roi_brightest_masks)
+
+        # Noise filtering slider connections
+        self.kernel_size_slider.valueChanged.connect(self._on_kernel_size_changed)
+        self.bg_percentile_slider.valueChanged.connect(self._on_bg_percentile_changed)
+        self.noise_floor_slider.valueChanged.connect(self._on_noise_floor_changed)
+        self.cache_size_spin.valueChanged.connect(self._on_cache_size_changed)
+
+    def _update_widget_states(self, video_loaded=False, rois_exist=False):
+        """Enable/disable widgets based on application state."""
+        self.frame_slider.setEnabled(video_loaded and not self._analysis_in_progress)
+        self.frame_spinbox.setEnabled(video_loaded and not self._analysis_in_progress)
+        self.prev_frame_btn.setEnabled(video_loaded and not self._analysis_in_progress)
+        self.next_frame_btn.setEnabled(video_loaded and not self._analysis_in_progress)
+        self.jump_back_btn.setEnabled(video_loaded and not self._analysis_in_progress)
+        self.jump_forward_btn.setEnabled(video_loaded and not self._analysis_in_progress)
+        self.analysis_range_slider.setEnabled(video_loaded and not self._analysis_in_progress)
+        self.range_start_spinbox.setEnabled(video_loaded and not self._analysis_in_progress)
+        self.range_end_spinbox.setEnabled(video_loaded and not self._analysis_in_progress)
+        self.range_start_current_btn.setEnabled(video_loaded and not self._analysis_in_progress)
+        self.range_end_current_btn.setEnabled(video_loaded and not self._analysis_in_progress)
+        self.range_full_btn.setEnabled(video_loaded and not self._analysis_in_progress)
+        self.auto_detect_btn.setEnabled(video_loaded and not self._analysis_in_progress)
+        self.analyze_btn.setEnabled(video_loaded and rois_exist and not self._analysis_in_progress)
+        
+        # Playback controls
+        self.play_pause_btn.setEnabled(video_loaded and not self._analysis_in_progress)
+        self.speed_combo.setEnabled(video_loaded and not self._analysis_in_progress)
+        self.add_rect_btn.setEnabled(video_loaded and not self._analysis_in_progress)
+        self.roi_width_spin.setEnabled(video_loaded and not self._analysis_in_progress)
+        self.roi_height_spin.setEnabled(video_loaded and not self._analysis_in_progress)
+        self.add_sized_roi_btn.setEnabled(video_loaded and not self._analysis_in_progress)
+        if video_loaded and self.frame is not None:
+            fh, fw = self.frame.shape[:2]
+            self.roi_width_spin.setMaximum(fw)
+            self.roi_height_spin.setMaximum(fh)
+        self.dup_rect_btn.setEnabled(video_loaded and self.selected_rect_idx is not None and not self._analysis_in_progress)
+        self.dup_multi_rect_btn.setEnabled(video_loaded and self.selected_rect_idx is not None and not self._analysis_in_progress)
+        self.del_rect_btn.setEnabled(video_loaded and self.selected_rect_idx is not None and not self._analysis_in_progress)
+        self.clear_rect_btn.setEnabled(video_loaded and rois_exist and not self._analysis_in_progress)
+        self.set_bg_btn.setEnabled(video_loaded and rois_exist and not self._analysis_in_progress)
+        self.set_bg_roi_btn.setEnabled(video_loaded and self.selected_rect_idx is not None and not self._analysis_in_progress)
+        self.threshold_spin.setEnabled(not self._analysis_in_progress)
+        # Fixed mask controls
+        if hasattr(self, 'use_fixed_mask_checkbox'):
+            self.use_fixed_mask_checkbox.setEnabled(video_loaded and rois_exist and not self._analysis_in_progress)
+        if hasattr(self, 'capture_mask_btn'):
+            self.capture_mask_btn.setEnabled(video_loaded and rois_exist and not self._analysis_in_progress)
+        if hasattr(self, 'auto_brightest_mask_btn'):
+            self.auto_brightest_mask_btn.setEnabled(video_loaded and rois_exist and not self._analysis_in_progress)
+        if hasattr(self, 'per_roi_brightest_btn'):
+            self.per_roi_brightest_btn.setEnabled(video_loaded and rois_exist and not self._analysis_in_progress)
+
+    def _set_busy_state(self, busy: bool):
+        """Apply busy state consistently across UI controls."""
+        self._analysis_in_progress = busy
+        video_loaded = bool(self.cap and self.cap.isOpened())
+        self._update_widget_states(video_loaded=video_loaded, rois_exist=bool(self.rects))
+        self._update_history_actions()
+
+    def _update_cache_status(self):
+        """Update cache status display."""
+        cache_size = self.frame_cache.get_size()
+        self.cache_status_label.setText(f"Cache: {cache_size}/{self.frame_cache_size} frames")
+
+    def _update_mask_pixel_count_display(self):
+        """Update sidebar label with per-ROI fixed mask pixel counts."""
+        if not hasattr(self, "mask_pixel_count_label"):
+            return
+
+        counts = []
+        for idx, mask in enumerate(getattr(self, "fixed_roi_masks", [])):
+            if idx == self.background_roi_idx:
+                continue  # Skip background ROI
+            if isinstance(mask, np.ndarray):
+                counts.append(int(np.count_nonzero(mask)))
+            else:
+                counts.append(None)
+
+        if counts and any(c is not None for c in counts):
+            # Format as array, showing 'n/a' for missing masks
+            count_strs = [str(c) if c is not None else "n/a" for c in counts]
+            total = sum(c for c in counts if c is not None)
+            self.mask_pixel_count_label.setText(f"Mask Pixels: [{', '.join(count_strs)}] = {total:,}")
+        else:
+            self.mask_pixel_count_label.setText("Mask Pixels: n/a")
+
+    def _invalidate_fixed_masks(self, reason: str = ""):
+        """Clear captured fixed masks when ROIs change or become invalid.
+        Optionally provide a reason for UI feedback.
+        """
+        if self.fixed_roi_masks:
+            self.fixed_roi_masks = [None for _ in self.rects]
+            self.mask_source_frames = [None for _ in self.rects]
+            if reason:
+                self.mask_status_label.setText(f"Mask: cleared ({reason})")
+            else:
+                self.mask_status_label.setText("Mask: cleared")
+        self._update_mask_pixel_count_display()
+
+    def _update_video_info(self):
+        """Update video information display."""
+        if not self.video_path or not self.cap:
+            self.video_info_label.setText("No video loaded")
+            self.file_info_label.setText("No video loaded")
+            return
+        
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        duration_sec = self.total_frames / fps if fps > 0 else 0
+        
+        file_name = os.path.basename(self.video_path)
+        file_size = os.path.getsize(self.video_path) / (1024 * 1024)  # MB
+        
+        info_text = f"""
+<b>File:</b> {file_name}<br>
+<b>Size:</b> {file_size:.1f} MB<br>
+<b>Resolution:</b> {width} × {height}<br>
+<b>Frames:</b> {self.total_frames}<br>
+<b>FPS:</b> {fps:.2f}<br>
+<b>Duration:</b> {duration_sec:.1f}s<br>
+<b>Analysis Range:</b> {self._normalized_analysis_range()[0] + 1}-{self._normalized_analysis_range()[1] + 1}
+        """.strip()
+        
+        self.video_info_label.setText(info_text)
+        self.file_info_label.setText(f"Loaded: {file_name}")
+
+    # --- Event Handling ---
+
+    # File-picker slot
+    def open_video_dialog(self):
+        """Present a file dialog to select a video file."""
+        initial_dir = os.path.dirname(self.video_path) if self.video_path else ""
+
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Open Video File",
+            initial_dir,
+            "Video Files (*.mp4 *.mov *.avi *.mkv *.wmv *.m4v *.flv);;All Files (*)"
+        )
+        if path:
+            self.video_path = path
+            self.load_video()
+
+    def dragEnterEvent(self, event: QtGui.QDragEnterEvent):
+        """Accept drag events if they contain URLs (files)."""
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction() # Use acceptProposedAction for clarity
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QtGui.QDropEvent):
+        """Handle dropped files, attempting to load the first valid video."""
+        urls = event.mimeData().urls()
+        if urls:
+            path = urls[0].toLocalFile()
+            # Basic check for video file extensions (can be improved)
+            if os.path.splitext(path)[1].lower() in ['.mp4', '.avi', '.mov', '.mkv', '.wmv']:
+                self.video_path = path
+                self.load_video() # Changed from load_first_frame
+            else:
+                QtWidgets.QMessageBox.warning(self, 'Invalid File',
+                                              f'Unsupported file type: {os.path.basename(path)}')
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def closeEvent(self, event: QtGui.QCloseEvent):
+        """Release resources and save settings when the window closes."""
+        self._cancel_active_worker()
+        if self._analysis_thread is not None:
+            self._analysis_thread.quit()
+            self._analysis_thread.wait(1500)
+        if self._audio_thread is not None:
+            self._audio_thread.quit()
+            self._audio_thread.wait(1500)
+        if self._mask_thread is not None:
+            self._mask_thread.quit()
+            self._mask_thread.wait(1500)
+
+        if self.cap:
+            self.cap.release()
+        self._save_settings()
+        super().closeEvent(event)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent):
+        """
+        Enhanced resize event handler with responsive layout updates.
+        Update cached label size *without* immediately redrawing the frame.
+        Calling show_frame() synchronously inside resizeEvent can create
+        a feedback loop: the freshly scaled pixmap changes the label's
+        sizeHint, Qt recalculates the layout, and another resizeEvent fires.
+        By deferring the redraw with QTimer.singleShot(0, …) we let the
+        resize settle first and repaint exactly once.
+        """
+        if hasattr(self, "image_label") and self.image_label.size().isValid():
+            self._current_image_size = self.image_label.size()
+
+            # Schedule a one‑shot repaint after the event loop returns.
+            if self.frame is not None:
+                QtCore.QTimer.singleShot(0, self.show_frame)
+
+        # Update splitter sizes responsively when window is resized significantly
+        if hasattr(self, "splitter") and event:
+            old_size = event.oldSize()
+            new_size = event.size()
+            if old_size.isValid():
+                # Only update if resize is significant (more than 100px change)
+                width_change = abs(new_size.width() - old_size.width())
+                if width_change > 100:
+                    QtCore.QTimer.singleShot(100, self._set_default_splitter_sizes)
+
+        # Call base-class handler last (standard Qt practice)
+        super().resizeEvent(event)
+
+    # --- Video Loading and Frame Display ---
+
+    def load_video(self):
+        """Loads the video specified by self.video_path."""
+        # Show loading feedback
+        self.statusBar().showMessage("📂 Loading video...")
+        self.file_info_label.setText("📂 Loading video file...")
+        QtWidgets.QApplication.processEvents()
+
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+
+        if not self.video_path or not os.path.exists(self.video_path):
+            QtWidgets.QMessageBox.critical(self, 'Error', 'Video path is invalid or file does not exist.')
+            self._reset_state()
+            return
+
+        self.statusBar().showMessage("⚙️ Initializing video decoder...")
+        QtWidgets.QApplication.processEvents()
+
+        self.cap = cv2.VideoCapture(self.video_path)
+        if not self.cap.isOpened():
+            QtWidgets.QMessageBox.critical(self, 'Error', f'Could not open video file: {os.path.basename(self.video_path)}')
+            self._reset_state()
+            return
+
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.playback_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        if self.playback_fps <= 0:
+            self.playback_fps = 30.0  # Default fallback
+            
+        if self.total_frames <= 0:
+            QtWidgets.QMessageBox.warning(self, 'Warning', 'Video file appears to have no frames.')
+            self._reset_state()
+            return
+
+        # Clear cache when loading new video
+        self.frame_cache.clear()
+        
+        self.current_frame_index = 0
+        self.start_frame = 0
+        self.end_frame = self.total_frames - 1
+        self._reset_history()
+
+        # Load the first frame
+        ret, frame = self.cap.read()
+        if ret:
+            self.frame = frame
+            self.frame_cache.put(0, frame)  # Cache first frame
+
+            # Ensure the pixmap scales to the label’s current size the first time we draw it
+            self._current_image_size = self.image_label.size()
+            
+            # Update UI elements for the loaded video
+            self.frame_slider.setRange(0, self.total_frames - 1)
+            self.frame_slider.setValue(0)
+            self.frame_spinbox.setRange(0, self.total_frames - 1)
+            self.frame_spinbox.setValue(0)
+            self.update_frame_label()
+            self._sync_analysis_range_widgets()
+            self.show_frame()
+            self._update_video_info()
+            self._update_cache_status()
+            self._update_threshold_display()
+            
+            # Add to recent files
+            self._add_recent_file(self.video_path)
+            
+            self.results_label.setText(f"✅ Loaded: {os.path.basename(self.video_path)}\n"
+                                       f"📊 Frames: {self.total_frames:,} | ⏱️ FPS: {self.playback_fps:.1f}\n"
+                                       f"⏳ Duration: {self.total_frames/self.playback_fps:.1f}s\n"
+                                       "🎯 Draw ROIs or use Auto-Detect to begin!")
+            self._update_widget_states(video_loaded=True, rois_exist=bool(self.rects))
+            self.statusBar().showMessage(f"✅ Successfully loaded: {os.path.basename(self.video_path)}")
+
+            # Reset fixed masks on new video load
+            self.fixed_roi_masks = [None for _ in self.rects]
+            self.mask_source_frames = [None for _ in self.rects]
+            self.use_fixed_mask_checkbox.setChecked(False)
+            self.mask_status_label.setText("Mask: none")
+            self._update_mask_pixel_count_display()
+
+            # Attempt auto-detection if ROIs already exist
+            if self.rects:
+                self.auto_detect_range()
+        else:
+            QtWidgets.QMessageBox.warning(self, 'Warning', 'Could not read the first frame of the video.')
+            self._reset_state()
+
+    def _reset_state(self):
+        """Resets the application state when a video fails to load or is closed."""
+        if self.cap:
+            self.cap.release()
+        self.video_path = None
+        self.frame = None
+        self.current_frame_index = 0
+        self.total_frames = 0
+        self.cap = None
+        self.rects = []
+        self.selected_rect_idx = None
+        self.start_frame = 0
+        self.end_frame = None
+        self.out_paths = []
+        self.frame_cache.clear()
+        self._reset_history()
+        
+        # Stop playback and reset controls
+        self.stop_playback()
+        self.speed_combo.setCurrentText("1x")
+        self.playback_speed = 1.0
+        
+        self.image_label.setText("Drag & Drop Video File Here")
+        self.image_label.setPixmap(QtGui.QPixmap())
+        self.update_frame_label(reset=True)
+        self.update_rect_list()
+        self.brightness_display_label.setText("N/A")
+        self.results_label.setText("Load a video to begin analysis.")
+        self.file_info_label.setText("No video loaded")
+        self.video_info_label.setText("No video loaded")
+        self.frame_slider.setRange(0, 0)
+        self.frame_spinbox.setRange(0, 0)
+        self._sync_analysis_range_widgets()
+        self._update_cache_status()
+        self._update_widget_states(video_loaded=False, rois_exist=False)
+        self.statusBar().showMessage("Ready - Load a video to begin")
+
+    def slider_frame_changed(self, value: int):
+        """Handles frame changes initiated by the slider."""
+        if self.cap and self.cap.isOpened() and value != self.current_frame_index:
+            self._seek_to_frame(value)
+            # Sync spinbox without triggering its signal
+            self.frame_spinbox.blockSignals(True)
+            self.frame_spinbox.setValue(value)
+            self.frame_spinbox.blockSignals(False)
+
+    def spinbox_frame_changed(self, value: int):
+        """Handles frame changes initiated by the spinbox."""
+        if self.cap and self.cap.isOpened() and value != self.current_frame_index:
+            # Sync slider, which will trigger slider_frame_changed -> _seek_to_frame
+            self.frame_slider.setValue(value)
+
+    def step_frames(self, delta: int):
+        """Moves forward or backward by a specified number of frames."""
+        if not self.cap or not self.cap.isOpened() or self.total_frames == 0:
+            return
+        new_idx = max(0, min(self.total_frames - 1, self.current_frame_index + delta))
+        if new_idx != self.current_frame_index:
+            self.frame_slider.setValue(new_idx) # Let slider signal handle the update
+
+    def toggle_playback(self):
+        """Toggle video playback on/off."""
+        if not self.cap or not self.cap.isOpened() or self.total_frames == 0:
+            return
+            
+        if self.is_playing:
+            self.stop_playback()
+        else:
+            self.start_playback()
+    
+    def start_playback(self):
+        """Start video playback."""
+        if not self.cap or not self.cap.isOpened() or self.total_frames == 0:
+            return
+        
+        self.is_playing = True
+        self.play_pause_btn.setText("⏸")
+        
+        # Calculate timer interval based on FPS and speed
+        if hasattr(self, 'playback_fps') and self.playback_fps > 0:
+            interval = int(1000 / (self.playback_fps * self.playback_speed))
+        else:
+            interval = int(1000 / (30.0 * self.playback_speed))  # Default 30 FPS
+        
+        self.playback_timer.start(interval)
+    
+    def stop_playback(self):
+        """Stop video playback."""
+        self.is_playing = False
+        self.play_pause_btn.setText("⏵")
+        self.playback_timer.stop()
+    
+    def advance_frame(self):
+        """Advance to next frame during playback."""
+        if not self.is_playing or not self.cap or not self.cap.isOpened():
+            return
+        
+        next_frame = self.current_frame_index + 1
+        if next_frame >= self.total_frames:
+            # Reached end of video, stop playback
+            self.stop_playback()
+            return
+        
+        self.frame_slider.setValue(next_frame)
+    
+    def on_speed_changed(self, speed_text: str):
+        """Handle playback speed change."""
+        try:
+            speed_value = float(speed_text.replace('x', ''))
+            self.playback_speed = speed_value
+            
+            # If currently playing, restart timer with new interval
+            if self.is_playing:
+                self.stop_playback()
+                self.start_playback()
+        except ValueError:
+            logging.warning(f"Invalid speed value: {speed_text}")
+
+    def _seek_to_frame(self, frame_index: int):
+        """Reads and displays the specified frame index with caching."""
+        if not self.cap or not self.cap.isOpened():
+            return
+        if frame_index < 0 or frame_index >= self.total_frames:
+            logging.warning(f"Attempted to seek to invalid frame index {frame_index}")
+            return
+
+        # Check cache first
+        cached_frame = self.frame_cache.get(frame_index)
+        if cached_frame is not None:
+            self.frame = cached_frame
+            self.current_frame_index = frame_index
+            self.show_frame()
+            self.update_frame_label()
+            self._update_current_brightness_display()
+            self._update_threshold_display()
+            return
+
+        # Not in cache, read from video
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        ret, frame = self.cap.read()
+        if ret:
+            self.frame = frame
+            self.current_frame_index = frame_index
+            
+            # Cache the frame
+            self.frame_cache.put(frame_index, frame)
+            self._update_cache_status()
+            
+            self.show_frame()
+            self.update_frame_label()
+            self._update_current_brightness_display()
+            self._update_threshold_display()
+        else:
+            logging.warning(f"Failed to read frame at index {frame_index}")
+
+    def update_frame_label(self, reset=False):
+        """Updates the frame counter label (e.g., "Frame: 10 / 100")."""
+        if reset or self.total_frames == 0:
+            self.frame_label.setText("Frame: 0 / 0")
+        else:
+            # Display 1-based index for user-friendliness
+            self.frame_label.setText(f"Frame: {self.current_frame_index + 1} / {self.total_frames}")
+        self._sync_analysis_range_widgets()
+
+    def show_frame(self):
+        """Displays the current self.frame in the image_label, drawing ROIs."""
+        if self.frame is None:
+            return
+
+        frame_copy = self.frame.copy()
+        
+        # Apply pixel mask visualization if enabled
+        if self.show_pixel_mask and len(self.rects) > 0:
+            frame_copy = self._apply_pixel_mask_overlay(frame_copy)
+            
+        self._draw_rois(frame_copy)
+
+        # Convert to QPixmap for display
+        rgb_image = cv2.cvtColor(frame_copy, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb_image.shape
+        bytes_per_line = ch * w
+        qt_image = QtGui.QImage(rgb_image.data, w, h, bytes_per_line, QtGui.QImage.Format_RGB888)
+        pixmap = QtGui.QPixmap.fromImage(qt_image)
+
+        # Scale pixmap to fit label while maintaining aspect ratio
+        target_size = self._current_image_size if self._current_image_size and self._current_image_size.isValid() else self.image_label.size()
+        if target_size.isValid() and not target_size.isEmpty():
+            scaled_pixmap = pixmap.scaled(target_size, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+            self.image_label.setPixmap(scaled_pixmap)
+        else:
+            # Fallback if target size is invalid (e.g., during init)
+            self.image_label.setPixmap(pixmap)
+
+
+    def _draw_rois(self, frame_to_draw_on):
+        """Draws all defined ROIs and the currently drawing ROI onto the frame."""
+        # Draw existing rectangles
+        for idx, (pt1, pt2) in enumerate(self.rects):
+            color = ROI_COLORS[idx % len(ROI_COLORS)]
+            thickness = ROI_THICKNESS_SELECTED if idx == self.selected_rect_idx else ROI_THICKNESS_DEFAULT
+            cv2.rectangle(frame_to_draw_on, pt1, pt2, color, thickness)
+            # Draw index label near the top-left corner
+            label = f"{idx+1}"
+            (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, ROI_LABEL_FONT_SCALE, ROI_LABEL_THICKNESS)
+            label_pos = (pt1[0] + 5, pt1[1] + text_height + 5)
+            # Simple background for label visibility
+            cv2.rectangle(frame_to_draw_on, (pt1[0], pt1[1]), (pt1[0] + text_width + 10, pt1[1] + text_height + 10), (0,0,0), cv2.FILLED)
+            cv2.putText(frame_to_draw_on, label, label_pos, cv2.FONT_HERSHEY_SIMPLEX, ROI_LABEL_FONT_SCALE, color, ROI_LABEL_THICKNESS, cv2.LINE_AA)
+
+        # Draw rectangle currently being drawn
+        if self.drawing and self.start_point and self.end_point:
+            # Map points from label coordinates to frame coordinates
+            pt1_frame, pt2_frame = self._map_label_to_frame_rect(self.start_point, self.end_point)
+            if pt1_frame and pt2_frame:
+                cv2.rectangle(frame_to_draw_on, pt1_frame, pt2_frame, (0, 255, 255), ROI_THICKNESS_DEFAULT) # Use a distinct color (cyan)
+
+    def _update_current_brightness_display(self):
+        """Calculates and displays comprehensive brightness information for the current frame's ROIs."""
+        if self.frame is None or not self.rects:
+            self.brightness_display_label.setText("N/A")
+            return
+
+        roi_data = []
+        background_brightness = None
+        fh, fw = self.frame.shape[:2]
+        
+        # Calculate background brightness if background ROI is defined
+        if self.background_roi_idx is not None:
+            background_brightness = self._compute_background_brightness(self.frame)
+        
+        for idx, (pt1, pt2) in enumerate(self.rects):
+            # Handle background ROI separately
+            if idx == self.background_roi_idx:
+                continue
+                
+            # Ensure ROI coordinates are valid within the frame
+            x1 = max(0, min(pt1[0], fw - 1))
+            y1 = max(0, min(pt1[1], fh - 1))
+            x2 = max(0, min(pt2[0], fw - 1))
+            y2 = max(0, min(pt2[1], fh - 1))
+
+            if x2 > x1 and y2 > y1: # Check for valid ROI area
+                roi = self.frame[y1:y2, x1:x2]
+                roi_mask = None
+                if self.use_fixed_mask and idx < len(self.fixed_roi_masks):
+                    roi_mask = self.fixed_roi_masks[idx]
+                    if isinstance(roi_mask, np.ndarray) and roi_mask.shape[:2] != roi.shape[:2]:
+                        roi_mask = None
+                brightness_stats = self._compute_brightness_stats(roi, background_brightness, roi_mask)
+                l_raw_mean, l_raw_median, l_bg_sub_mean, l_bg_sub_median, b_raw_mean, b_raw_median = brightness_stats[:6]
+                roi_data.append((idx, l_raw_mean, l_raw_median, l_bg_sub_mean, l_bg_sub_median, b_raw_mean, b_raw_median))
+            else:
+                roi_data.append((idx, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)) # Append zeros if ROI is invalid/empty
+
+        if roi_data:
+            # Build comprehensive display
+            display_lines = ["Current Brightness:"]
+            
+            for idx, l_raw_mean, l_raw_median, l_bg_sub_mean, l_bg_sub_median, b_raw_mean, b_raw_median in roi_data:
+                if self.background_roi_idx is not None:
+                    # Show L* with background subtraction and blue channel
+                    display_lines.append(f"ROI {idx+1}: L* {l_raw_mean:.1f} (BG-Sub: {l_bg_sub_mean:.1f}) | Blue: {b_raw_mean:.0f}")
+                else:
+                    # Show raw L* and blue channel when no background ROI
+                    display_lines.append(f"ROI {idx+1}: L* {l_raw_mean:.1f} | Blue: {b_raw_mean:.0f}")
+            
+            # Add background ROI info if defined
+            if self.background_roi_idx is not None and background_brightness is not None:
+                # Calculate blue channel for background ROI
+                bg_pt1, bg_pt2 = self.rects[self.background_roi_idx]
+                bg_x1 = max(0, min(bg_pt1[0], fw - 1))
+                bg_y1 = max(0, min(bg_pt1[1], fh - 1))
+                bg_x2 = max(0, min(bg_pt2[0], fw - 1))
+                bg_y2 = max(0, min(bg_pt2[1], fh - 1))
+                
+                if bg_x2 > bg_x1 and bg_y2 > bg_y1:
+                    bg_roi = self.frame[bg_y1:bg_y2, bg_x1:bg_x2]
+                    _, _, _, _, bg_b_mean, _, _, _ = self._compute_brightness_stats(bg_roi)
+                    display_lines.append(f"Background: L* {background_brightness:.1f} | Blue: {bg_b_mean:.0f}")
+            
+            self.brightness_display_label.setText("\n".join(display_lines))
+        else:
+            self.brightness_display_label.setText("N/A")
+
+
+    # --- ROI Management ---
+
+    def update_rect_list(self, preferred_row: Optional[int] = None):
+        """Updates the QListWidget displaying the ROIs."""
+        self.rect_list.blockSignals(True) # Prevent selection signals during update
+        current_row = preferred_row if preferred_row is not None else self.rect_list.currentRow()
+        self.rect_list.clear()
+        for idx, (pt1, pt2) in enumerate(self.rects):
+            x1, y1 = pt1
+            x2, y2 = pt2
+            # Ensure coordinates are ordered correctly for display
+            disp_x1, disp_y1 = min(x1, x2), min(y1, y2)
+            disp_x2, disp_y2 = max(x1, x2), max(y1, y2)
+            prefix = "* " if idx == self.background_roi_idx else ""
+            self.rect_list.addItem(f"{prefix}ROI {idx+1}: ({disp_x1},{disp_y1})-({disp_x2},{disp_y2})")
+
+        # Restore selection if possible
+        if 0 <= current_row < len(self.rects):
+             self.rect_list.setCurrentRow(current_row)
+        elif len(self.rects) > 0:
+             # If previous selection invalid, select the last one if available
+             self.rect_list.setCurrentRow(len(self.rects) - 1)
+        else:
+             self.selected_rect_idx = None # No items, no selection
+
+        self.rect_list.blockSignals(False)
+        # Keep fixed masks list aligned with rects
+        if len(self.fixed_roi_masks) != len(self.rects):
+            # Resize/realign masks; default to None for new or mismatched entries
+            new_masks: List[Optional[np.ndarray]] = []
+            new_sources: List[Optional[int]] = []
+            for i in range(len(self.rects)):
+                if i < len(self.fixed_roi_masks):
+                    new_masks.append(self.fixed_roi_masks[i])
+                else:
+                    new_masks.append(None)
+                if i < len(self.mask_source_frames):
+                    new_sources.append(self.mask_source_frames[i])
+                else:
+                    new_sources.append(None)
+            self.fixed_roi_masks = new_masks
+            self.mask_source_frames = new_sources
+        self._update_mask_pixel_count_display()
+
+        self._update_widget_states(video_loaded=bool(self.cap), rois_exist=bool(self.rects))
+        self._update_threshold_display()
+
+
+    def toggle_add_rectangle_mode(self, checked: bool):
+        """Enters or exits the mode for drawing a new ROI."""
+        self.drawing = checked
+        if checked:
+            self.selected_rect_idx = None # Deselect any existing rectangle
+            self.update_rect_list() # Update list to show no selection
+            self.image_label.setCursor(QtCore.Qt.CrossCursor) # Change cursor
+            self.results_label.setText("Click and drag on the frame to draw a new ROI.")
+        else:
+            self.image_label.unsetCursor()
+        self.show_frame() # Redraw to potentially remove selection highlight
+
+    def add_roi_by_size(self):
+        """Add a centered ROI using the width/height from the spinboxes."""
+        if self.frame is None:
+            self.results_label.setText("Load a video before adding an ROI.")
+            return
+
+        before = self._capture_editor_snapshot()
+        fh, fw = self.frame.shape[:2]
+        width = min(self.roi_width_spin.value(), fw)
+        height = min(self.roi_height_spin.value(), fh)
+
+        # Center the ROI in the frame
+        x1 = max(0, (fw - width) // 2)
+        y1 = max(0, (fh - height) // 2)
+        x2 = min(fw, x1 + width)
+        y2 = min(fh, y1 + height)
+
+        self.rects.append(((x1, y1), (x2, y2)))
+        self.selected_rect_idx = len(self.rects) - 1
+        self._invalidate_fixed_masks("ROI added")
+        self.update_rect_list(preferred_row=self.selected_rect_idx)
+        self.show_frame()
+        self.results_label.setText(
+            f"Added ROI {self.selected_rect_idx + 1}: {width}\u00d7{height} px at ({x1},{y1})\u2013({x2},{y2})."
+        )
+        self._record_history_change("Add ROI", before)
+
+    def select_rectangle_from_list(self, row: int):
+        """Handles selection changes in the ROI list widget."""
+        if 0 <= row < len(self.rects):
+            self.selected_rect_idx = row
+            self.drawing = False # Exit drawing mode if active
+            self.add_rect_btn.setChecked(False)
+            self.image_label.unsetCursor()
+        else:
+            self.selected_rect_idx = None
+        self._update_widget_states(video_loaded=bool(self.cap), rois_exist=bool(self.rects))
+        self.show_frame() # Redraw to highlight selected rectangle
+
+    def _nudge_selected_rectangle(self, dx: int, dy: int) -> bool:
+        """Move selected ROI by dx/dy pixels while clamping to frame bounds."""
+        if self.selected_rect_idx is None or not (0 <= self.selected_rect_idx < len(self.rects)):
+            return False
+        if self.frame is None:
+            return False
+        if dx == 0 and dy == 0:
+            return False
+
+        source_rect = self.rects[self.selected_rect_idx]
+        moved_rect = _offset_rect_within_bounds(source_rect, dx=dx, dy=dy, frame_shape=self.frame.shape[:2])
+        if moved_rect == source_rect:
+            return False
+
+        before = self._capture_editor_snapshot()
+        self.rects[self.selected_rect_idx] = moved_rect
+        self._invalidate_fixed_masks("ROI nudged")
+        self.update_rect_list(preferred_row=self.selected_rect_idx)
+        self._update_current_brightness_display()
+        self.show_frame()
+        self._record_history_change("Move ROI", before)
+        return True
+
+    def _handle_horizontal_shortcut(self, direction: int, accelerated: bool):
+        """Left/right key handler: nudge selected ROI or step frames."""
+        if self._analysis_in_progress:
+            return
+
+        step = 10 if accelerated else 1
+        if self.selected_rect_idx is not None and not (self.drawing or self.moving or self.resizing):
+            self._nudge_selected_rectangle(dx=direction * step, dy=0)
+            return
+
+        self.step_frames(direction * step)
+
+    def _handle_vertical_nudge_shortcut(self, direction: int, accelerated: bool):
+        """Up/down key handler for selected ROI vertical nudging."""
+        if self._analysis_in_progress:
+            return
+        if self.selected_rect_idx is None or self.drawing or self.moving or self.resizing:
+            return
+        step = 10 if accelerated else 1
+        self._nudge_selected_rectangle(dx=0, dy=direction * step)
+
+    def _duplicate_from_source_rect(
+        self,
+        source_rect: Tuple[Tuple[int, int], Tuple[int, int]],
+        copies: int,
+    ) -> int:
+        """Create up to `copies` duplicates of source_rect and return count created."""
+        if copies <= 0:
+            return 0
+
+        frame_shape = self.frame.shape[:2] if isinstance(self.frame, np.ndarray) else None
+        normalized_rect = _offset_rect_within_bounds(source_rect, 0, 0, frame_shape)
+
+        occupied = set(self.rects)
+        created = 0
+        for copy_idx in range(copies):
+            scale = copy_idx + 1
+            step = ROI_DUPLICATE_OFFSET * scale
+            candidate_offsets = [
+                (step, step),
+                (-step, step),
+                (step, -step),
+                (-step, -step),
+                (step * 2, 0),
+                (0, step * 2),
+                (-step * 2, 0),
+                (0, -step * 2),
+                (0, 0),
+            ]
+
+            chosen_rect = None
+            for dx, dy in candidate_offsets:
+                candidate = _offset_rect_within_bounds(normalized_rect, dx, dy, frame_shape)
+                if candidate not in occupied:
+                    chosen_rect = candidate
+                    break
+
+            if chosen_rect is None:
+                break
+
+            self.rects.append(chosen_rect)
+            occupied.add(chosen_rect)
+            created += 1
+
+        if created > 0:
+            self.selected_rect_idx = len(self.rects) - 1
+            self._invalidate_fixed_masks("ROI duplicated")
+            self.update_rect_list(preferred_row=self.selected_rect_idx)
+            if self.frame is not None:
+                self.show_frame()
+
+        return created
+
+    def duplicate_selected_rectangle(self):
+        """Duplicate the selected ROI with a small offset."""
+        if self.selected_rect_idx is None or not (0 <= self.selected_rect_idx < len(self.rects)):
+            self.results_label.setText("Select an ROI to duplicate.")
+            return
+
+        before = self._capture_editor_snapshot()
+        source_idx = self.selected_rect_idx
+        created = self._duplicate_from_source_rect(self.rects[source_idx], copies=1)
+        if created == 1 and self.selected_rect_idx is not None:
+            self.results_label.setText(f"Duplicated ROI {source_idx + 1} to ROI {self.selected_rect_idx + 1}.")
+            self._record_history_change("Duplicate ROI", before)
+        else:
+            self.results_label.setText("No space to create a distinct duplicate ROI in the current frame.")
+
+    def duplicate_selected_rectangle_multiple(self):
+        """Prompt for count and create multiple duplicates of the selected ROI."""
+        if self.selected_rect_idx is None or not (0 <= self.selected_rect_idx < len(self.rects)):
+            self.results_label.setText("Select an ROI to duplicate.")
+            return
+
+        copies, ok = QtWidgets.QInputDialog.getInt(
+            self,
+            "Duplicate ROI",
+            "Number of copies:",
+            3,
+            2,
+            25,
+            1,
+        )
+        if not ok:
+            return
+
+        before = self._capture_editor_snapshot()
+        source_idx = self.selected_rect_idx
+        created = self._duplicate_from_source_rect(self.rects[source_idx], copies=copies)
+        if created == copies:
+            self.results_label.setText(f"Duplicated ROI {source_idx + 1} into {created} new ROIs.")
+            self._record_history_change("Duplicate ROI", before)
+        elif created > 0:
+            self.results_label.setText(
+                f"Created {created}/{copies} duplicates of ROI {source_idx + 1} (reached frame boundary)."
+            )
+            self._record_history_change("Duplicate ROI", before)
+        else:
+            self.results_label.setText("No space to create distinct duplicate ROIs in the current frame.")
+
+    def delete_selected_rectangle(self):
+        """Deletes the currently selected ROI."""
+        if self.selected_rect_idx is not None and 0 <= self.selected_rect_idx < len(self.rects):
+            before = self._capture_editor_snapshot()
+            del self.rects[self.selected_rect_idx]
+            # Remove corresponding fixed mask and invalidate
+            if self.selected_rect_idx is not None and self.selected_rect_idx < len(self.fixed_roi_masks):
+                del self.fixed_roi_masks[self.selected_rect_idx]
+            self._invalidate_fixed_masks("ROI deleted")
+            
+            # Handle background ROI index adjustment
+            if self.background_roi_idx == self.selected_rect_idx:
+                self.background_roi_idx = None
+            elif self.background_roi_idx is not None and self.selected_rect_idx < self.background_roi_idx:
+                self.background_roi_idx -= 1
+            
+            # Adjust selection if the deleted item wasn't the last one
+            if self.selected_rect_idx >= len(self.rects) and len(self.rects) > 0:
+                 self.selected_rect_idx = len(self.rects) - 1
+            elif len(self.rects) == 0:
+                 self.selected_rect_idx = None
+            # No need to explicitly set selection index otherwise, update_rect_list handles it
+            self.update_rect_list(preferred_row=self.selected_rect_idx)
+            self.show_frame()
+            self.results_label.setText("Deleted selected ROI.")
+            self._record_history_change("Delete ROI", before)
+
+    def clear_all_rectangles(self):
+        """Removes all defined ROIs."""
+        if not self.rects: return # Nothing to clear
+        reply = QtWidgets.QMessageBox.question(self, 'Confirm Clear',
+                                               'Are you sure you want to delete all ROIs?',
+                                               QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                                               QtWidgets.QMessageBox.No)
+        if reply == QtWidgets.QMessageBox.Yes:
+            before = self._capture_editor_snapshot()
+            self.rects.clear()
+            self.selected_rect_idx = None
+            self.background_roi_idx = None
+            self.fixed_roi_masks = []
+            self.mask_source_frames = []
+            self.use_fixed_mask_checkbox.setChecked(False)
+            self.mask_status_label.setText("Mask: none")
+            self._update_mask_pixel_count_display()
+            self.update_rect_list()
+            self.show_frame()
+            self.results_label.setText("Cleared all ROIs.")
+            self._record_history_change("Clear All ROIs", before)
+
+    def _set_background_roi(self):
+        """Mark current ROI as background reference for auto-detect."""
+        if self.selected_rect_idx is None:
+            QtWidgets.QMessageBox.information(self, "Background ROI",
+                                              "Select an ROI first.")
+            return
+
+        before = self._capture_editor_snapshot()
+        self.background_roi_idx = self.selected_rect_idx
+        
+        # Calculate background threshold for display
+        if self.frame is not None:
+            threshold_value = self._calculate_background_threshold()
+            if threshold_value is not None:
+                self.results_label.setText(f"Background ROI set to ROI {self.selected_rect_idx + 1}\n"
+                                         f"Current background threshold: {threshold_value:.2f} L*")
+            else:
+                self.results_label.setText(f"Background ROI set to ROI {self.selected_rect_idx + 1}\n"
+                                         f"(Threshold will be calculated during full video scan)")
+        else:
+            self.results_label.setText(f"Background ROI set to ROI {self.selected_rect_idx + 1}")
+        
+        self.update_rect_list()
+        self._record_history_change("Set Background ROI", before)
+
+    def _calculate_background_threshold(self) -> Optional[float]:
+        """Calculate the current background threshold based on background ROI or manual setting."""
+        if self.background_roi_idx is not None and self.frame is not None:
+            # Calculate threshold from current frame's background ROI
+            if 0 <= self.background_roi_idx < len(self.rects):
+                pt1, pt2 = self.rects[self.background_roi_idx]
+                fh, fw = self.frame.shape[:2]
+                
+                # Ensure ROI coordinates are valid within the frame
+                x1 = max(0, min(pt1[0], fw - 1))
+                y1 = max(0, min(pt1[1], fh - 1))
+                x2 = max(0, min(pt2[0], fw - 1))
+                y2 = max(0, min(pt2[1], fh - 1))
+                
+                if x2 > x1 and y2 > y1:
+                    roi = self.frame[y1:y2, x1:x2]
+                    l_raw_mean, _, _, _, _, _, _, _ = self._compute_brightness_stats(roi)
+                    return l_raw_mean
+        
+        # If no background ROI or calculation failed, return manual threshold
+        return None
+
+    def _update_threshold_display(self):
+        """Update the threshold display label with current active threshold."""
+        if self.background_roi_idx is not None:
+            # Background ROI mode
+            if self.frame is not None:
+                threshold_value = self._calculate_background_threshold()
+                if threshold_value is not None:
+                    self.threshold_display_label.setText(f"Active Threshold: Background ROI {self.background_roi_idx + 1} ({threshold_value:.2f} L*)")
+                else:
+                    self.threshold_display_label.setText(f"Active Threshold: Background ROI {self.background_roi_idx + 1} (calculating...)")
+            else:
+                self.threshold_display_label.setText(f"Active Threshold: Background ROI {self.background_roi_idx + 1} (no frame)")
+        else:
+            # Manual threshold mode
+            self.threshold_display_label.setText(f"Active Threshold: Manual ({self.manual_threshold:.2f} L*)")
+
+    def _on_mask_checkbox_toggled(self, checked: bool):
+        """Handle pixel mask visualization checkbox toggle."""
+        self.show_pixel_mask = checked
+        if self.frame is not None:
+            self.show_frame()
+
+    def _apply_pixel_mask_overlay(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Apply red overlay to show which pixels are being analyzed in each ROI.
+        
+        Args:
+            frame: BGR frame to apply overlay to
+            
+        Returns:
+            Frame with red mask overlay applied
+        """
+        overlay = frame.copy()
+
+        # Precompute L* for current frame and derive background brightness
+        l_star_frame = self._compute_l_star_frame(frame)
+        background_brightness = self._compute_background_brightness(frame, frame_l_star=l_star_frame)
+        
+        for roi_idx, (pt1, pt2) in enumerate(self.rects):
+            # Skip background ROI
+            if roi_idx == self.background_roi_idx:
+                continue
+                
+            # Extract ROI bounds
+            fh, fw = frame.shape[:2]
+            x1 = max(0, min(pt1[0], fw - 1))
+            y1 = max(0, min(pt1[1], fh - 1))
+            x2 = max(0, min(pt2[0], fw - 1))
+            y2 = max(0, min(pt2[1], fh - 1))
+            
+            if x2 > x1 and y2 > y1:
+                roi = frame[y1:y2, x1:x2]
+                roi_l_star = l_star_frame[y1:y2, x1:x2]
+                try:
+                    use_fixed = self.use_fixed_mask and roi_idx < len(self.fixed_roi_masks) and isinstance(self.fixed_roi_masks[roi_idx], np.ndarray)
+                    mask = None
+                    if use_fixed:
+                        fixed_mask = self.fixed_roi_masks[roi_idx]
+                        if fixed_mask is not None and fixed_mask.shape[:2] == roi.shape[:2]:
+                            mask = fixed_mask.astype(bool)
+                        else:
+                            # Shape mismatch - ignore fixed mask
+                            mask = None
+
+                    if mask is None:
+                        # Derive mask from current frame using cached L* channel
+                        if background_brightness is not None:
+                            mask = roi_l_star > background_brightness
+                        else:
+                            mask = np.ones_like(roi_l_star, dtype=bool)
+                    
+                    # Apply red overlay to analyzed pixels
+                    roi_overlay = roi.copy()
+                    roi_overlay[mask] = roi_overlay[mask] * 0.7 + np.array([0, 0, 255]) * 0.3  # Red tint
+                    
+                    # Apply overlay back to main frame
+                    overlay[y1:y2, x1:x2] = roi_overlay
+                    
+                except Exception:
+                    logging.exception("Error creating pixel mask for ROI %s", roi_idx + 1)
+                    continue
+        
+        return overlay
+
+    def _on_threshold_changed(self, value: float):
+        """Handle changes to the manual threshold spinbox."""
+        if self._history_restoring:
+            self.manual_threshold = value
+            self._update_threshold_display()
+            return
+        before = self._capture_editor_snapshot()
+        self.manual_threshold = value
+        self._update_threshold_display()
+        self._record_history_change("Adjust Manual Threshold", before)
+
+    def _on_use_fixed_mask_toggled(self, checked: bool):
+        """Enable/disable using a fixed mask across frames."""
+        if self._history_restoring:
+            self.use_fixed_mask = checked
+        else:
+            before = self._capture_editor_snapshot()
+            self.use_fixed_mask = checked
+        if checked and (not self.fixed_roi_masks or all(m is None for m in self.fixed_roi_masks)):
+            self.mask_status_label.setText("Mask: none (capture from a frame)")
+        elif checked:
+            self.mask_status_label.setText("Mask: active")
+        else:
+            self.mask_status_label.setText("Mask: disabled")
+        if self.frame is not None:
+            self._update_current_brightness_display()
+            self.show_frame()
+        if not self._history_restoring:
+            self._record_history_change("Toggle Fixed Mask", before)
+
+    def _capture_fixed_masks(self, source_frame_idx: Optional[int] = None):
+        """Capture analyzed-pixel masks for all ROIs based on the current frame.
+
+        Args:
+            source_frame_idx: If provided, record this as the source frame for all masks.
+                            If None, uses the current frame slider position.
+        """
+        if self.frame is None or not self.rects:
+            QtWidgets.QMessageBox.information(self, "Capture Mask", "Load a video and define at least one ROI.")
+            return
+
+        frame = self.frame
+        fh, fw = frame.shape[:2]
+        # Determine background brightness once from current frame
+        l_star_frame = self._compute_l_star_frame(frame)
+        background_brightness = self._compute_background_brightness(frame, frame_l_star=l_star_frame)
+
+        # Determine source frame index
+        if source_frame_idx is None:
+            source_frame_idx = self.frame_slider.value()
+        before = None if self._history_restoring else self._capture_editor_snapshot()
+
+        masks: List[Optional[np.ndarray]] = []
+        sources: List[Optional[int]] = []
+        created_any = False
+        for roi_idx, (pt1, pt2) in enumerate(self.rects):
+            if roi_idx == self.background_roi_idx:
+                masks.append(None)
+                sources.append(None)
+                continue
+            x1 = max(0, min(pt1[0], fw - 1))
+            y1 = max(0, min(pt1[1], fh - 1))
+            x2 = max(0, min(pt2[0], fw - 1))
+            y2 = max(0, min(pt2[1], fh - 1))
+            if x2 > x1 and y2 > y1:
+                roi_l_star = l_star_frame[y1:y2, x1:x2]
+                try:
+                    if background_brightness is not None:
+                        mask = roi_l_star > background_brightness
+                        # Morphological cleanup similar to analysis
+                        if np.any(mask):
+                            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (self.morphological_kernel_size, self.morphological_kernel_size))
+                            mask_uint8 = mask.astype(np.uint8) * 255
+                            cleaned = cv2.morphologyEx(mask_uint8, cv2.MORPH_OPEN, kernel)
+                            mask = cleaned > 0
+                    else:
+                        # If no background brightness, default to full ROI
+                        mask = np.ones(roi_l_star.shape, dtype=bool)
+                    masks.append(mask)
+                    sources.append(source_frame_idx)
+                    created_any = True
+                except Exception as e:
+                    logging.warning(f"Failed to capture mask for ROI {roi_idx+1}: {e}")
+                    masks.append(None)
+                    sources.append(None)
+            else:
+                masks.append(None)
+                sources.append(None)
+
+        self.fixed_roi_masks = masks
+        self.mask_source_frames = sources
+        if created_any:
+            self.mask_status_label.setText(f"Mask: captured from frame {source_frame_idx}")
+            if not self.use_fixed_mask:
+                # Auto-enable usage for convenience
+                self.use_fixed_mask = True
+                self.use_fixed_mask_checkbox.blockSignals(True)
+                self.use_fixed_mask_checkbox.setChecked(True)
+                self.use_fixed_mask_checkbox.blockSignals(False)
+        else:
+            self.mask_status_label.setText("Mask: none (could not capture)")
+        self._update_mask_pixel_count_display()
+        if self.frame is not None:
+            self._update_current_brightness_display()
+            self.show_frame()
+        if before is not None:
+            self._record_history_change("Capture Fixed Masks", before)
+
+    def _auto_capture_brightest_frame_masks(self):
+        """Find the brightest frame in the current range and capture masks from it."""
+        if self._analysis_in_progress:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Busy",
+                "Please wait for the current task to complete or cancel it first.",
+            )
+            return
+
+        if self.cap is None or not self.rects:
+            QtWidgets.QMessageBox.information(self, "Auto-Capture Masks",
+                                            "Load a video and define at least one ROI first.")
+            return
+
+        if not self.rects:
+            QtWidgets.QMessageBox.information(self, "Auto-Capture Masks",
+                                            "Define at least one ROI before capturing masks.")
+            return
+
+        # Use current frame range or full video if not set
+        start_frame = max(0, self.start_frame)
+        end_frame = min(self.total_frames - 1, self.end_frame if self.end_frame is not None else self.total_frames - 1)
+
+        if start_frame >= end_frame:
+            QtWidgets.QMessageBox.information(self, "Auto-Capture Masks",
+                                            "Invalid frame range for analysis.")
+            return
+
+        step = max(1, (end_frame - start_frame) // 100)
+        request = MaskScanRequest(
+            video_path=self.video_path,
+            rects=[((int(pt1[0]), int(pt1[1])), (int(pt2[0]), int(pt2[1]))) for pt1, pt2 in self.rects],
+            background_roi_idx=self.background_roi_idx,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            step=step,
+            background_percentile=self.background_percentile,
+            morphological_kernel_size=self.morphological_kernel_size,
+        )
+        self._start_mask_worker(
+            worker=BrightestFrameWorker(request),
+            label="Finding brightest frame...",
+            title="Auto-Capture Masks",
+            task_type="global",
+        )
+
+    def _auto_capture_per_roi_brightest_masks(self):
+        """Find the brightest frame for EACH ROI independently and capture masks.
+
+        Unlike _auto_capture_brightest_frame_masks which uses a single frame for all ROIs,
+        this method finds the optimal frame for each ROI individually, allowing each
+        electrode to be captured at its peak brightness.
+        """
+        if self._analysis_in_progress:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Busy",
+                "Please wait for the current task to complete or cancel it first.",
+            )
+            return
+
+        if self.cap is None or not self.rects:
+            QtWidgets.QMessageBox.information(self, "Per-ROI Auto-Capture",
+                                            "Load a video and define at least one ROI first.")
+            return
+
+        # Build list of non-background ROI indices
+        roi_indices = [i for i in range(len(self.rects)) if i != self.background_roi_idx]
+        if not roi_indices:
+            QtWidgets.QMessageBox.information(self, "Per-ROI Auto-Capture",
+                                            "Define at least one non-background ROI.")
+            return
+
+        # Use current frame range or full video if not set
+        start_frame = max(0, self.start_frame)
+        end_frame = min(self.total_frames - 1, self.end_frame if self.end_frame is not None else self.total_frames - 1)
+
+        if start_frame >= end_frame:
+            QtWidgets.QMessageBox.information(self, "Per-ROI Auto-Capture",
+                                            "Invalid frame range for analysis.")
+            return
+
+        step = max(1, (end_frame - start_frame) // 100)
+        request = MaskScanRequest(
+            video_path=self.video_path,
+            rects=[((int(pt1[0]), int(pt1[1])), (int(pt2[0]), int(pt2[1]))) for pt1, pt2 in self.rects],
+            background_roi_idx=self.background_roi_idx,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            step=step,
+            background_percentile=self.background_percentile,
+            morphological_kernel_size=self.morphological_kernel_size,
+        )
+        self._start_mask_worker(
+            worker=PerRoiMaskCaptureWorker(request),
+            label="Finding brightest frame per ROI...",
+            title="Per-ROI Auto-Capture",
+            task_type="per_roi",
+        )
+
+    def _start_mask_worker(self, worker: QtCore.QObject, label: str, title: str, task_type: str):
+        """Start a mask-related background worker with shared progress plumbing."""
+        self._set_busy_state(True)
+        self.stop_playback()
+
+        progress = QtWidgets.QProgressDialog(label, "Cancel", 0, 100, self)
+        progress.setWindowModality(QtCore.Qt.WindowModal)
+        progress.setWindowTitle(title)
+        progress.setValue(0)
+        progress.canceled.connect(self._cancel_active_worker)
+        progress.show()
+
+        self._mask_task_type = task_type
+        self._mask_progress = progress
+        self._mask_thread = QtCore.QThread()
+        self._mask_worker = worker
+        self._mask_worker.moveToThread(self._mask_thread)
+        self._mask_thread.started.connect(self._mask_worker.run)  # type: ignore[attr-defined]
+        self._mask_worker.progress_changed.connect(self._on_mask_worker_progress)  # type: ignore[attr-defined]
+        self._mask_worker.progress_message.connect(self._on_mask_worker_message)  # type: ignore[attr-defined]
+        self._mask_worker.error.connect(self._on_mask_worker_error)  # type: ignore[attr-defined]
+        self._mask_worker.cancelled.connect(self._on_mask_worker_cancelled)  # type: ignore[attr-defined]
+        if task_type == "global":
+            self._mask_worker.finished.connect(self._on_global_brightest_finished)  # type: ignore[attr-defined]
+        else:
+            self._mask_worker.finished.connect(self._on_per_roi_mask_finished)  # type: ignore[attr-defined]
+        self._mask_thread.start()
+
+    def _on_mask_worker_progress(self, current: int, total: int):
+        """Update mask worker progress."""
+        if self._mask_progress is not None:
+            self._mask_progress.setMaximum(max(1, total))
+            self._mask_progress.setValue(current)
+
+    def _on_mask_worker_message(self, message: str):
+        """Update mask worker status messages."""
+        if self._mask_progress is not None:
+            self._mask_progress.setLabelText(message)
+        self.statusBar().showMessage(message)
+
+    def _on_global_brightest_finished(self, result_obj: object):
+        """Apply global brightest-frame scan result."""
+        result = result_obj if isinstance(result_obj, BrightestFrameResult) else None
+        self._cleanup_mask_worker()
+        if result is None:
+            self.results_label.setText("Auto-capture failed: invalid worker result.")
+            return
+
+        self.frame_slider.setValue(result.brightest_frame_idx)
+        self._capture_fixed_masks(source_frame_idx=result.brightest_frame_idx)
+        QtWidgets.QMessageBox.information(
+            self,
+            "Auto-Capture Complete",
+            f"Captured masks from frame {result.brightest_frame_idx} (brightness: {result.max_brightness:.1f} L*)",
+        )
+
+    def _on_per_roi_mask_finished(self, result_obj: object):
+        """Apply per-ROI mask capture results."""
+        result = result_obj if isinstance(result_obj, PerRoiMaskCaptureResult) else None
+        self._cleanup_mask_worker()
+        if result is None:
+            self.results_label.setText("Per-ROI auto-capture failed: invalid worker result.")
+            return
+
+        before = self._capture_editor_snapshot()
+        self.fixed_roi_masks = result.masks
+        self.mask_source_frames = result.sources
+
+        created_count = sum(1 for m in result.masks if m is not None)
+        frame_info = [
+            str(result.sources[i]) if result.sources[i] is not None else "n/a"
+            for i in range(len(self.rects))
+            if i != self.background_roi_idx
+        ]
+        if created_count > 0:
+            self.mask_status_label.setText(f"Mask: frames [{', '.join(frame_info)}]")
+            if not self.use_fixed_mask:
+                self.use_fixed_mask = True
+                self.use_fixed_mask_checkbox.blockSignals(True)
+                self.use_fixed_mask_checkbox.setChecked(True)
+                self.use_fixed_mask_checkbox.blockSignals(False)
+        else:
+            self.mask_status_label.setText("Mask: none (could not capture)")
+
+        self._update_mask_pixel_count_display()
+        if self.frame is not None:
+            self._update_current_brightness_display()
+            self.show_frame()
+        self._record_history_change("Capture Fixed Masks", before)
+
+        unique_frames = len(set(f for f in result.sources if f is not None))
+        QtWidgets.QMessageBox.information(
+            self,
+            "Per-ROI Auto-Capture Complete",
+            f"Captured masks for {created_count} ROIs from {unique_frames} unique frames.\n\n"
+            f"Frame sources: [{', '.join(frame_info)}]",
+        )
+
+    def _on_mask_worker_error(self, message: str):
+        """Handle mask-worker errors."""
+        self._cleanup_mask_worker()
+        QtWidgets.QMessageBox.warning(self, "Mask Capture Error", message)
+        self.results_label.setText(f"Mask capture failed: {message}")
+        logging.error("Mask capture error: %s", message)
+
+    def _on_mask_worker_cancelled(self):
+        """Handle cancellation for mask workers."""
+        self._cleanup_mask_worker()
+        self.results_label.setText("Mask capture cancelled.")
+
+    def _cleanup_mask_worker(self):
+        """Tear down mask worker resources safely."""
+        if self._mask_progress is not None:
+            self._mask_progress.close()
+            self._mask_progress = None
+
+        if self._mask_thread is not None:
+            self._mask_thread.quit()
+            self._mask_thread.wait(1500)
+            self._mask_thread = None
+
+        self._mask_worker = None
+        self._mask_task_type = None
+        self._set_busy_state(False)
+
+    def _on_kernel_size_changed(self, value: int):
+        """Handle morphological kernel size slider change."""
+        before = None if self._history_restoring else self._capture_editor_snapshot()
+        self.morphological_kernel_size = max(1, value if value % 2 == 1 else value - 1)  # Ensure odd value
+        self.kernel_size_label.setText(f"{self.morphological_kernel_size}×{self.morphological_kernel_size}")
+        # Update display and invalidate cached masks since filtering changed
+        self._invalidate_fixed_masks("noise parameters changed")
+        if self.frame is not None:
+            self._update_current_brightness_display()
+            self.show_frame()
+        if before is not None:
+            self._record_history_change("Adjust Mask Kernel", before)
+
+    def _on_bg_percentile_changed(self, value: int):
+        """Handle background percentile slider change."""
+        before = None if self._history_restoring else self._capture_editor_snapshot()
+        self.background_percentile = float(value)
+        self.bg_percentile_label.setText(f"{self.background_percentile:.0f}%")
+        # Update display since background calculation changed
+        if self.frame is not None:
+            self._update_current_brightness_display()
+            self._update_threshold_display()
+            self.show_frame()
+        if before is not None:
+            self._record_history_change("Adjust Background Percentile", before)
+
+    def _on_noise_floor_changed(self, value: int):
+        """Handle noise floor threshold slider change."""
+        before = None if self._history_restoring else self._capture_editor_snapshot()
+        self.noise_floor_threshold = value / 2.0  # Convert back from 0.5 precision
+        self.noise_floor_label.setText(f"{self.noise_floor_threshold:.1f}")
+        # Update display since noise filtering changed
+        self._invalidate_fixed_masks("noise parameters changed")
+        if self.frame is not None:
+            self._update_current_brightness_display()
+            self.show_frame()
+        if before is not None:
+            self._record_history_change("Adjust Noise Floor", before)
+
+    def _on_cache_size_changed(self, value: int):
+        """Handle frame cache size changes."""
+        self.frame_cache_size = int(value)
+        self.frame_cache = FrameCache(self.frame_cache_size)
+        self._update_cache_status()
+        self._save_settings()
+
+    # --- Mouse Interaction on Image Label ---
+
+    def image_mouse_press(self, event: QtGui.QMouseEvent):
+        """Handles mouse clicks on the video display area."""
+        if self.frame is None or event.button() != QtCore.Qt.LeftButton:
+            return # Ignore if no video or not left click
+
+        pos_in_label = event.pos() # Position relative to the image_label widget
+
+        # Check if the click is within the actual displayed pixmap area
+        pixmap_rect = self._get_pixmap_rect_in_label()
+        if not pixmap_rect or not pixmap_rect.contains(pos_in_label):
+             return # Click was outside the image area (in borders/empty space)
+
+        # Convert click position to frame coordinates
+        frame_x, frame_y = self._map_label_to_frame_point(pos_in_label)
+        if frame_x is None: return # Mapping failed
+        
+        class zoomable(ctk.CTk):
+            def __init__(self):
+                super().__init__()
+
+                self.zoom_factor = 1.0 # controls zoom level
+                self.zoom_increment = 0.1
+            # frame
+                self.frame = ctk.CTkFrame(self)
+                self.frame.pack(fill="both", expand=True)
+            # widgets
+                self.label = ctk.CTkLabel(self.frame, text="Zoom Scale", font=("Arial", 20))
+                self.label.place(relx=0.5, rely=0.5, anchor="center")
+
+            # binds mouse wheel / +- for zoom
+                self.bind("<MouseWheel>", self.zoom)
+                self.bind("<KeyPress-+>", self.zoom_in)
+                self.bind("<KeyPress-minus>", self.zoom_out)
+
+            def zoom(self, event):
+                if event.delta > 0:
+                    self.zoom_in(event)
+                else:
+                    self.zoom_out(event)
+            
+            def zoom_in(self, event):
+                self.set_zoom(self.zoom_factor + self.zoom_increment)
+            
+            def zoom_out(self, event):
+                self.set_zoom(self.zoom_factor - self.zoom_increment)
+            
+            def set_zoom(self, new_zoom_factor):
+                if 0.5 <= new_zoom_factor <= 2.0: # limits for zoom
+                    self.zoom_factor = new_zoom_factor
+                    self.update_widgets()
+                # widgets get adjusted according to new zoom factor
+            def update_widgets(self):
+                new_font_size = int(20 * self.zoom_factor)
+                self.label.configure(font=("Arial", new_font_size))
+
+                self.button.configure(width=int(100 * self.zoom_factor), height = int(30 * self.zoom_factor))
+                
+                self.label.place_configure(relx = 0.5, rely = 0.5)
+                self.button.place_configure(relx = 0.5, rely = 0.6)
+
+        if self.drawing:
+            # Start drawing a new rectangle
+            self._begin_history_action("Draw ROI")
+            self.start_point = pos_in_label # Store label coordinates for drawing feedback
+            self.end_point = pos_in_label
+            self.moving = False
+            self.resizing = False
+            self.resize_corner = None
+            self.resize_origin_rect = None
+            self.resize_aspect_ratio = None
+        elif self.selected_rect_idx is not None:
+            # Check if clicking near an edge/corner of selected rectangle for resizing
+            pt1, pt2 = self.rects[self.selected_rect_idx]
+            resize_margin = self._scale_value_for_pixmap(MOUSE_RESIZE_HANDLE_SENSITIVITY)
+            resize_handle = self._get_resize_handle(frame_x, frame_y, (pt1, pt2), resize_margin)
+            if resize_handle is not None:
+                self._begin_history_action("Resize ROI")
+                self.resizing = True
+                self.resize_corner = resize_handle
+                self.resize_origin_rect = ((pt1[0], pt1[1]), (pt2[0], pt2[1]))
+                roi_w = abs(pt2[0] - pt1[0])
+                roi_h = abs(pt2[1] - pt1[1])
+                self.resize_aspect_ratio = (roi_w / roi_h) if roi_h > 0 else None
+
+                # Corners use fixed opposite point; edges use origin rect directly.
+                if resize_handle == "corner_tl":
+                    fixed_point = (max(pt1[0], pt2[0]), max(pt1[1], pt2[1]))
+                elif resize_handle == "corner_tr":
+                    fixed_point = (min(pt1[0], pt2[0]), max(pt1[1], pt2[1]))
+                elif resize_handle == "corner_bl":
+                    fixed_point = (max(pt1[0], pt2[0]), min(pt1[1], pt2[1]))
+                elif resize_handle == "corner_br":
+                    fixed_point = (min(pt1[0], pt2[0]), min(pt1[1], pt2[1]))
+                else:
+                    fixed_point = None
+
+                self.start_point = self._map_frame_to_label_point(fixed_point) if fixed_point is not None else None
+                if fixed_point is not None and self.start_point is None:
+                    self.resizing = False
+                    self.resize_corner = None
+                    self.resize_origin_rect = None
+                    self.resize_aspect_ratio = None
+                    return
+                self.end_point = pos_in_label
+                self.moving = False
+                self.drawing = False
+                self.image_label.setCursor(self._get_cursor_for_resize_handle(resize_handle))
+                self.show_frame()
+                return # Resizing initiated
+
+            # Check if clicking inside the selected rectangle for moving
+            pt1, pt2 = self.rects[self.selected_rect_idx]
+            rect_x1, rect_y1 = min(pt1[0], pt2[0]), min(pt1[1], pt2[1])
+            rect_x2, rect_y2 = max(pt1[0], pt2[0]), max(pt1[1], pt2[1])
+            if rect_x1 <= frame_x <= rect_x2 and rect_y1 <= frame_y <= rect_y2:
+                self._begin_history_action("Move ROI")
+                self.moving = True
+                # Calculate offset from top-left corner of the rect
+                self.move_offset = (frame_x - rect_x1, frame_y - rect_y1)
+                self.start_point = pos_in_label # Store initial position for smooth dragging
+                self.resizing = False
+                self.resize_corner = None
+                self.resize_origin_rect = None
+                self.resize_aspect_ratio = None
+                self.drawing = False
+                self.image_label.setCursor(QtCore.Qt.SizeAllCursor) # Set move cursor
+                self.show_frame()
+                return # Moving initiated
+
+        # If click wasn't for drawing, resizing, or moving a selected rect,
+        # check if it hit any *other* rectangle to select it.
+        clicked_on_rect_idx = -1
+        for idx, (pt1, pt2) in enumerate(self.rects):
+             rect_x1, rect_y1 = min(pt1[0], pt2[0]), min(pt1[1], pt2[1])
+             rect_x2, rect_y2 = max(pt1[0], pt2[0]), max(pt1[1], pt2[1])
+             if rect_x1 <= frame_x <= rect_x2 and rect_y1 <= frame_y <= rect_y2:
+                  clicked_on_rect_idx = idx
+                  break # Found a rect, stop checking
+
+        if clicked_on_rect_idx != -1 and clicked_on_rect_idx != self.selected_rect_idx:
+             # Clicked on a different rectangle, select it
+             self.selected_rect_idx = clicked_on_rect_idx
+             self.drawing = False # Ensure not in drawing mode
+             self.add_rect_btn.setChecked(False)
+             self.image_label.unsetCursor()
+             self.update_rect_list() # Update list selection
+             self.show_frame() # Redraw to highlight new selection
+        elif clicked_on_rect_idx == -1 and not self.drawing:
+             # Clicked outside any rectangle and not drawing, deselect
+             self.selected_rect_idx = None
+             self.update_rect_list()
+             self.show_frame()
+
+
+    def image_mouse_move(self, event: QtGui.QMouseEvent):
+        """Handles mouse movement over the video display area."""
+        if self.frame is None: return
+
+        pos_in_label = event.pos()
+        frame_h, frame_w = self.frame.shape[:2]
+
+        if self.drawing and self.start_point:
+            # Update the end point for drawing feedback
+            # Clamp position to within the label bounds
+            clamped_x = max(0, min(pos_in_label.x(), self.image_label.width() - 1))
+            clamped_y = max(0, min(pos_in_label.y(), self.image_label.height() - 1))
+            self.end_point = QtCore.QPoint(clamped_x, clamped_y)
+            self.show_frame() # Redraw to show the rectangle being drawn
+
+        elif self.moving and self.selected_rect_idx is not None and self.start_point:
+            # Move the selected rectangle
+            frame_x, frame_y = self._map_label_to_frame_point(pos_in_label)
+            if frame_x is None or frame_y is None: 
+                return # Mapping failed
+
+            pt1, pt2 = self.rects[self.selected_rect_idx]
+            orig_w = abs(pt2[0] - pt1[0])
+            orig_h = abs(pt2[1] - pt1[1])
+
+            # Calculate new top-left based on mouse position and initial offset
+            new_x1 = frame_x - self.move_offset[0]
+            new_y1 = frame_y - self.move_offset[1]
+
+            # Clamp new position to stay within frame boundaries
+            new_x1 = max(0, min(new_x1, frame_w - orig_w))
+            new_y1 = max(0, min(new_y1, frame_h - orig_h))
+            new_x2 = new_x1 + orig_w
+            new_y2 = new_y1 + orig_h
+
+            self.rects[self.selected_rect_idx] = ((new_x1, new_y1), (new_x2, new_y2))
+            self.update_rect_list() # Update coordinates in the list
+            self.show_frame()
+
+        elif self.resizing and self.selected_rect_idx is not None:
+            # Resize the selected rectangle
+            frame_x, frame_y = self._map_label_to_frame_point(pos_in_label)
+            if frame_x is None or frame_y is None: 
+                return # Mapping failed
+
+            # Clamp mouse position to frame boundaries before calculating new rect
+            frame_x = max(0, min(frame_x, frame_w - 1))
+            frame_y = max(0, min(frame_y, frame_h - 1))
+            resize_handle = self.resize_corner if isinstance(self.resize_corner, str) else None
+            if resize_handle is None:
+                return
+
+            if resize_handle.startswith("corner"):
+                if self.start_point is None:
+                    return
+                fixed_corner_frame = self._map_label_to_frame_point(self.start_point)
+                if fixed_corner_frame[0] is None or fixed_corner_frame[1] is None:
+                    return
+                fixed_x, fixed_y = fixed_corner_frame
+                raw_dx = frame_x - fixed_x
+                raw_dy = frame_y - fixed_y
+                sign_x = 1 if raw_dx >= 0 else -1
+                sign_y = 1 if raw_dy >= 0 else -1
+                abs_dx = max(1, abs(raw_dx))
+                abs_dy = max(1, abs(raw_dy))
+
+                modifiers = event.modifiers()
+                aspect_ratio = self.resize_aspect_ratio if self.resize_aspect_ratio else None
+                lock_aspect = bool(modifiers & QtCore.Qt.ShiftModifier) and aspect_ratio and aspect_ratio > 0
+                if lock_aspect and aspect_ratio is not None:
+                    fit_dy = max(1, int(round(abs_dx / aspect_ratio)))
+                    fit_dx = max(1, int(round(abs_dy * aspect_ratio)))
+                    if abs(fit_dy - abs_dy) <= abs(fit_dx - abs_dx):
+                        abs_dy = fit_dy
+                    else:
+                        abs_dx = fit_dx
+
+                    max_dx = fixed_x if sign_x < 0 else (frame_w - 1 - fixed_x)
+                    max_dy = fixed_y if sign_y < 0 else (frame_h - 1 - fixed_y)
+                    max_dx = max(1, max_dx)
+                    max_dy = max(1, max_dy)
+
+                    scale = 1.0
+                    if abs_dx > max_dx:
+                        scale = min(scale, max_dx / abs_dx)
+                    if abs_dy > max_dy:
+                        scale = min(scale, max_dy / abs_dy)
+                    if scale < 1.0:
+                        abs_dx = max(1, int(round(abs_dx * scale)))
+                        abs_dy = max(1, int(round(abs_dy * scale)))
+
+                    abs_dx = max(1, min(abs_dx, max_dx))
+                    abs_dy = max(1, min(abs_dy, max_dy))
+                    frame_x = fixed_x + sign_x * abs_dx
+                    frame_y = fixed_y + sign_y * abs_dy
+
+                new_x1 = min(fixed_x, frame_x)
+                new_y1 = min(fixed_y, frame_y)
+                new_x2 = max(fixed_x, frame_x)
+                new_y2 = max(fixed_y, frame_y)
+            else:
+                origin = self.resize_origin_rect or self.rects[self.selected_rect_idx]
+                (ox1, oy1), (ox2, oy2) = origin
+                left, right = min(ox1, ox2), max(ox1, ox2)
+                top, bottom = min(oy1, oy2), max(oy1, oy2)
+
+                new_x1, new_y1, new_x2, new_y2 = left, top, right, bottom
+                if resize_handle == "edge_left":
+                    new_x1 = min(max(0, frame_x), new_x2 - 1)
+                elif resize_handle == "edge_right":
+                    new_x2 = max(min(frame_w - 1, frame_x), new_x1 + 1)
+                elif resize_handle == "edge_top":
+                    new_y1 = min(max(0, frame_y), new_y2 - 1)
+                elif resize_handle == "edge_bottom":
+                    new_y2 = max(min(frame_h - 1, frame_y), new_y1 + 1)
+
+            if new_x1 < new_x2 and new_y1 < new_y2:
+                self.rects[self.selected_rect_idx] = ((new_x1, new_y1), (new_x2, new_y2))
+                self.update_rect_list(preferred_row=self.selected_rect_idx)
+                self.show_frame()
+        else:
+            # Update cursor if hovering over a resize handle or a selectable rectangle
+            self._update_hover_cursor(pos_in_label)
+
+
+    def image_mouse_release(self, event: QtGui.QMouseEvent):
+        """Handles mouse button releases on the video display area."""
+        if self.frame is None or event.button() != QtCore.Qt.LeftButton:
+            return
+
+        self.image_label.unsetCursor()  # Reset cursor after action
+
+        if self.drawing and self.start_point and self.end_point:
+            # Finalize drawing a new rectangle
+            pt1_frame, pt2_frame = self._map_label_to_frame_rect(self.start_point, self.end_point)
+
+            # Add rectangle only if it has a valid size
+            if pt1_frame and pt2_frame and abs(pt1_frame[0] - pt2_frame[0]) > 1 and abs(pt1_frame[1] - pt2_frame[1]) > 1:
+                # Ensure pt1 is top-left and pt2 is bottom-right
+                final_x1 = min(pt1_frame[0], pt2_frame[0])
+                final_y1 = min(pt1_frame[1], pt2_frame[1])
+                final_x2 = max(pt1_frame[0], pt2_frame[0])
+                final_y2 = max(pt1_frame[1], pt2_frame[1])
+                self.rects.append(((final_x1, final_y1), (final_x2, final_y2)))
+                self.selected_rect_idx = len(self.rects) - 1 # Select the new rectangle
+                self._invalidate_fixed_masks("ROI added")
+                self.update_rect_list(preferred_row=self.selected_rect_idx)
+
+            # Reset drawing state
+            self.drawing = False
+            self.start_point = None
+            self.end_point = None
+            self.add_rect_btn.setChecked(False) # Uncheck button
+            self.show_frame() # Redraw
+            self._commit_history_action()
+
+        elif self.moving:
+            # Finalize moving
+            self.moving = False
+            self.move_offset = None
+            self.start_point = None
+            # Optional: Recalculate brightness display for the final position
+            self._update_current_brightness_display()
+            # Moving ROI invalidates any captured masks (shape/position may change)
+            self._invalidate_fixed_masks("ROI moved")
+            self.show_frame() # Redraw in final state
+            self._commit_history_action()
+
+        elif self.resizing:
+            # Finalize resizing
+            self.resizing = False
+            self.resize_corner = None
+            self.resize_origin_rect = None
+            self.resize_aspect_ratio = None
+            self.start_point = None
+            self.end_point = None
+            # Optional: Recalculate brightness display for the final size
+            self._update_current_brightness_display()
+            # Resizing ROI invalidates any captured masks (shape changed)
+            self._invalidate_fixed_masks("ROI resized")
+            self.show_frame() # Redraw in final state
+            self._commit_history_action()
+
+    def _get_pixmap_rect_in_label(self) -> Optional[QtCore.QRect]:
+        """Calculates the QRect occupied by the scaled pixmap within the image label."""
+        if not hasattr(self, 'image_label') or self.frame is None:
+            return None
+
+        label_size = self.image_label.size()
+        pixmap = self.image_label.pixmap() # Get the currently displayed pixmap
+
+        if not pixmap or pixmap.isNull() or not label_size.isValid() or label_size.isEmpty():
+            return None # No pixmap or invalid label size
+
+        return geometry_get_pixmap_rect_in_label(label_size, pixmap.size())
+
+    def _map_label_to_frame_point(self, label_pos: QtCore.QPoint) -> Tuple[Optional[int], Optional[int]]:
+        """Maps a point from image label coordinates to original frame coordinates."""
+        if self.frame is None: 
+            return None, None
+
+        pixmap_rect = self._get_pixmap_rect_in_label()
+        if not pixmap_rect: 
+            return None, None
+
+        frame_h, frame_w = self.frame.shape[:2]
+        return geometry_map_label_to_frame_point(label_pos, pixmap_rect, (frame_h, frame_w))
+
+    def _map_label_to_frame_rect(self, label_pt1: QtCore.QPoint, label_pt2: QtCore.QPoint) -> Tuple[Optional[Tuple[int, int]], Optional[Tuple[int, int]]]:
+         """Maps a rectangle defined by two points in label coordinates to frame coordinates."""
+         if self.frame is None:
+             return None, None
+         pixmap_rect = self._get_pixmap_rect_in_label()
+         if not pixmap_rect:
+             return None, None
+         frame_h, frame_w = self.frame.shape[:2]
+         return geometry_map_label_to_frame_rect(label_pt1, label_pt2, pixmap_rect, (frame_h, frame_w))
+
+    def _map_frame_to_label_point(self, frame_pos: Tuple[int, int]) -> Optional[QtCore.QPoint]:
+        """Maps a point from original frame coordinates back to image label coordinates."""
+        if self.frame is None: 
+            return None
+
+        pixmap_rect = self._get_pixmap_rect_in_label()
+        if not pixmap_rect: 
+            return None
+
+        frame_h, frame_w = self.frame.shape[:2]
+        return geometry_map_frame_to_label_point(frame_pos, pixmap_rect, (frame_h, frame_w))
+
+    def _scale_value_for_pixmap(self, value_in_frame_coords: float) -> float:
+        """Scales a value (like a distance) from frame coordinates to pixmap coordinates."""
+        if self.frame is None: return value_in_frame_coords # No scaling if no frame
+
+        pixmap_rect = self._get_pixmap_rect_in_label()
+        if not pixmap_rect or pixmap_rect.width() == 0: return value_in_frame_coords
+
+        frame_w = self.frame.shape[1]
+        return geometry_scale_value_for_pixmap(value_in_frame_coords, pixmap_rect, frame_w)
+
+    def _get_resize_cursor(self, corner_index: int) -> QtGui.QCursor:
+        """Returns the appropriate resize cursor based on the corner index."""
+        if corner_index == 0 or corner_index == 3: # Top-left or Bottom-right
+            return QtGui.QCursor(QtCore.Qt.SizeFDiagCursor)
+        elif corner_index == 1 or corner_index == 2: # Top-right or Bottom-left
+            return QtGui.QCursor(QtCore.Qt.SizeBDiagCursor)
+        else:
+            return QtGui.QCursor(QtCore.Qt.ArrowCursor) # Default
+
+    def _get_resize_handle(
+        self,
+        frame_x: int,
+        frame_y: int,
+        rect: Tuple[Tuple[int, int], Tuple[int, int]],
+        margin: float,
+    ) -> Optional[str]:
+        """Return active resize handle for a point near selected ROI edges/corners."""
+        (x1, y1), (x2, y2) = rect
+        left, right = min(x1, x2), max(x1, x2)
+        top, bottom = min(y1, y2), max(y1, y2)
+        m = max(2, int(round(margin)))
+
+        # Corners first so they win over edge hits.
+        corners = {
+            "corner_tl": (left, top),
+            "corner_tr": (right, top),
+            "corner_bl": (left, bottom),
+            "corner_br": (right, bottom),
+        }
+        for handle, (cx, cy) in corners.items():
+            if abs(frame_x - cx) <= m and abs(frame_y - cy) <= m:
+                return handle
+
+        within_x = left <= frame_x <= right
+        within_y = top <= frame_y <= bottom
+        near_left = abs(frame_x - left) <= m and within_y
+        near_right = abs(frame_x - right) <= m and within_y
+        near_top = abs(frame_y - top) <= m and within_x
+        near_bottom = abs(frame_y - bottom) <= m and within_x
+
+        if near_left:
+            return "edge_left"
+        if near_right:
+            return "edge_right"
+        if near_top:
+            return "edge_top"
+        if near_bottom:
+            return "edge_bottom"
+        return None
+
+    def _get_cursor_for_resize_handle(self, handle: str) -> QtGui.QCursor:
+        """Map resize handle names to cursor shapes."""
+        mapping = {
+            "corner_tl": QtCore.Qt.SizeFDiagCursor,
+            "corner_br": QtCore.Qt.SizeFDiagCursor,
+            "corner_tr": QtCore.Qt.SizeBDiagCursor,
+            "corner_bl": QtCore.Qt.SizeBDiagCursor,
+            "edge_left": QtCore.Qt.SizeHorCursor,
+            "edge_right": QtCore.Qt.SizeHorCursor,
+            "edge_top": QtCore.Qt.SizeVerCursor,
+            "edge_bottom": QtCore.Qt.SizeVerCursor,
+        }
+        return QtGui.QCursor(mapping.get(handle, QtCore.Qt.ArrowCursor))
+
+    def _update_hover_cursor(self, pos_in_label: QtCore.QPoint):
+        """Sets the cursor shape based on what the mouse is hovering over."""
+        if self.frame is None or self.drawing or self.moving or self.resizing:
+            # Don't change cursor if an action is in progress or no video
+            return
+
+        frame_x, frame_y = self._map_label_to_frame_point(pos_in_label)
+        if frame_x is None:
+            self.image_label.unsetCursor()
+            return # Outside pixmap
+
+        cursor_set = False
+
+        # Check for resize handles on the selected rectangle first
+        if self.selected_rect_idx is not None:
+            resize_margin = self._scale_value_for_pixmap(MOUSE_RESIZE_HANDLE_SENSITIVITY)
+            selected_rect = self.rects[self.selected_rect_idx]
+            resize_handle = self._get_resize_handle(frame_x, frame_y, selected_rect, resize_margin)
+            if resize_handle is not None:
+                self.image_label.setCursor(self._get_cursor_for_resize_handle(resize_handle))
+                cursor_set = True
+
+        # If not hovering over a resize handle, check if hovering over any rectangle
+        if not cursor_set:
+            for idx, (pt1, pt2) in enumerate(self.rects):
+                rect_x1, rect_y1 = min(pt1[0], pt2[0]), min(pt1[1], pt2[1])
+                rect_x2, rect_y2 = max(pt1[0], pt2[0]), max(pt1[1], pt2[1])
+                if rect_x1 <= frame_x <= rect_x2 and rect_y1 <= frame_y <= rect_y2:
+                    if idx == self.selected_rect_idx:
+                        # Hovering over the selected rectangle (not on a handle) -> Move cursor
+                        self.image_label.setCursor(QtCore.Qt.SizeAllCursor)
+                    else:
+                        # Hovering over a non-selected rectangle -> Pointer cursor
+                        self.image_label.setCursor(QtCore.Qt.PointingHandCursor)
+                    cursor_set = True
+                    break
+
+        # If not hovering over anything specific, reset to default
+        if not cursor_set:
+            self.image_label.unsetCursor()
+
+
+    # --- Frame Range Selection ---
+
+    def _normalized_analysis_range(
+        self,
+        start_frame: Optional[int] = None,
+        end_frame: Optional[int] = None,
+    ) -> Tuple[int, int]:
+        """Clamp and normalize an analysis range to the loaded video bounds."""
+        if self.total_frames <= 0:
+            return 0, 0
+
+        start = self.start_frame if start_frame is None else start_frame
+        end = self.end_frame if end_frame is None else end_frame
+        safe_start = max(0, min(int(start), self.total_frames - 1))
+        default_end = self.total_frames - 1 if end is None else int(end)
+        safe_end = max(0, min(default_end, self.total_frames - 1))
+        if safe_end < safe_start:
+            safe_end = safe_start
+        return safe_start, safe_end
+
+    def _format_analysis_window_summary(self) -> str:
+        """Build the compact analysis-range summary shown in the timeline."""
+        if self.total_frames <= 0:
+            return "Analysis Window: not set"
+
+        start, end = self._normalized_analysis_range()
+        frame_count = (end - start) + 1
+        duration = frame_count / self.playback_fps if self.playback_fps > 0 else 0.0
+        return (
+            f"Analysis Window: Frames {start + 1}-{end + 1} "
+            f"({frame_count:,} frames, {duration:.2f}s)"
+        )
+
+    def _sync_analysis_range_widgets(self):
+        """Refresh the range editor widgets from the current start/end values."""
+        if not hasattr(self, "analysis_range_slider"):
+            return
+
+        if self.total_frames <= 0:
+            self.analysis_range_slider.set_range(0, 0)
+            self.analysis_range_slider.set_values(0, 0)
+            self.analysis_range_slider.set_current_value(0)
+            self.analysis_range_summary_label.setText("Analysis Window: not set")
+
+            for spinbox in (self.range_start_spinbox, self.range_end_spinbox):
+                spinbox.blockSignals(True)
+                spinbox.setRange(0, 0)
+                spinbox.setValue(0)
+                spinbox.blockSignals(False)
+            return
+
+        start, end = self._normalized_analysis_range()
+        self.start_frame = start
+        self.end_frame = end
+
+        self.analysis_range_slider.set_range(0, self.total_frames - 1)
+        self.analysis_range_slider.set_values(start, end)
+        self.analysis_range_slider.set_current_value(self.current_frame_index)
+        self.analysis_range_summary_label.setText(self._format_analysis_window_summary())
+
+        self.range_start_spinbox.blockSignals(True)
+        self.range_start_spinbox.setRange(1, self.total_frames)
+        self.range_start_spinbox.setValue(start + 1)
+        self.range_start_spinbox.blockSignals(False)
+
+        self.range_end_spinbox.blockSignals(True)
+        self.range_end_spinbox.setRange(1, self.total_frames)
+        self.range_end_spinbox.setValue(end + 1)
+        self.range_end_spinbox.blockSignals(False)
+
+        if self.cap and self.cap.isOpened():
+            self._update_video_info()
+
+    def _apply_analysis_range(
+        self,
+        start_frame: int,
+        end_frame: int,
+        *,
+        result_message: Optional[str] = None,
+        seek_to_frame: Optional[int] = None,
+    ) -> bool:
+        """Apply a new analysis range and update the coupled widgets."""
+        if not self.cap or not self.cap.isOpened() or self.total_frames <= 0:
+            return False
+
+        normalized_start, normalized_end = self._normalized_analysis_range(start_frame, end_frame)
+        changed = (
+            normalized_start != self.start_frame
+            or normalized_end != self.end_frame
+        )
+
+        self.start_frame = normalized_start
+        self.end_frame = normalized_end
+        self._sync_analysis_range_widgets()
+        self._update_threshold_display()
+
+        if seek_to_frame is not None:
+            target = max(0, min(int(seek_to_frame), self.total_frames - 1))
+            self.frame_slider.blockSignals(True)
+            self.frame_spinbox.blockSignals(True)
+            self.frame_slider.setValue(target)
+            self.frame_spinbox.setValue(target)
+            self.frame_slider.blockSignals(False)
+            self.frame_spinbox.blockSignals(False)
+            self._seek_to_frame(target)
+
+        if result_message:
+            self.results_label.setText(result_message)
+        return changed
+
+    def _on_analysis_range_slider_changed(self, start_frame: int, end_frame: int):
+        """Handle direct manipulation of the analysis range slider."""
+        self._apply_analysis_range(start_frame, end_frame)
+
+    def _on_range_start_spinbox_changed(self, value: int):
+        """Handle typed start-frame updates from the range editor."""
+        if self._history_restoring or self.total_frames <= 0:
+            return
+        before = self._capture_editor_snapshot()
+        changed = self._apply_analysis_range(value - 1, self.end_frame if self.end_frame is not None else value - 1)
+        if changed:
+            self._record_history_change("Set Analysis Start", before)
+
+    def _on_range_end_spinbox_changed(self, value: int):
+        """Handle typed end-frame updates from the range editor."""
+        if self._history_restoring or self.total_frames <= 0:
+            return
+        before = self._capture_editor_snapshot()
+        changed = self._apply_analysis_range(self.start_frame, value - 1)
+        if changed:
+            self._record_history_change("Set Analysis End", before)
+
+    def reset_analysis_range_to_full_video(self):
+        """Reset the analysis range to cover the entire loaded video."""
+        if not self.cap or not self.cap.isOpened() or self.total_frames <= 0:
+            return
+        before = self._capture_editor_snapshot()
+        changed = self._apply_analysis_range(
+            0,
+            self.total_frames - 1,
+            result_message="Analysis window reset to the full video.",
+        )
+        if changed:
+            self._record_history_change("Reset Analysis Window", before)
+
+    def set_start_frame(self):
+        """Sets the current frame as the start frame for analysis."""
+        if self.cap and self.cap.isOpened():
+            before = self._capture_editor_snapshot()
+            changed = self._apply_analysis_range(
+                self.current_frame_index,
+                self.end_frame if self.end_frame is not None else self.current_frame_index,
+                result_message=f"Start frame set to {self.current_frame_index + 1}",
+            )
+            if changed:
+                self._record_history_change("Set Analysis Start", before)
+
+    def set_end_frame(self):
+        """Sets the current frame as the end frame for analysis."""
+        if self.cap and self.cap.isOpened():
+            before = self._capture_editor_snapshot()
+            changed = self._apply_analysis_range(
+                self.start_frame,
+                self.current_frame_index,
+                result_message=f"End frame set to {self.current_frame_index + 1}",
+            )
+            if changed:
+                self._record_history_change("Set Analysis End", before)
+
+    def auto_detect_range(self):
+        """
+        Analyzes video audio to detect completion beeps and calculates frame ranges 
+        using the expected run duration.
+        """
+        if self._analysis_in_progress:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Busy",
+                "Please wait for the current task to complete or cancel it first.",
+            )
+            return
+
+        if not self.video_path:
+            self.results_label.setText("Load a video first.")
+            return
+        
+        if not self.audio_analyzer.is_available():
+            QtWidgets.QMessageBox.warning(self, "Audio Detection", 
+                "Audio analysis not available. Please install librosa:\npip install librosa soundfile")
+            return
+        
+        # Get expected run duration
+        expected_duration = self.run_duration_spin.value()
+        if expected_duration <= 0.0:
+            QtWidgets.QMessageBox.warning(self, "Audio Detection", 
+                "Please set an expected run duration (> 0 seconds) to calculate start frames from detected completion beeps.")
+            return
+
+        self._set_busy_state(True)
+        self.stop_playback()
+        self._pending_audio_expected_duration = expected_duration
+        self.results_label.setText("Audio Detection: analyzing audio for completion beeps...")
+
+        progress = QtWidgets.QProgressDialog("Analyzing audio for completion beeps...", "Cancel", 0, 0, self)
+        progress.setWindowModality(QtCore.Qt.WindowModal)
+        progress.setWindowTitle("Audio Detection")
+        progress.setRange(0, 0)
+        progress.canceled.connect(self._cancel_active_worker)
+        progress.show()
+        self._audio_progress = progress
+
+        self._audio_thread = QtCore.QThread()
+        self._audio_worker = AudioDetectionWorker(self.video_path, expected_duration)
+        self._audio_worker.moveToThread(self._audio_thread)
+        self._audio_thread.started.connect(self._audio_worker.run)
+        self._audio_worker.finished.connect(self._on_audio_detection_finished)
+        self._audio_worker.error.connect(self._on_audio_detection_error)
+        self._audio_worker.cancelled.connect(self._on_audio_detection_cancelled)
+        self._audio_thread.start()
+
+    def _apply_audio_detection_results(self, completion_beeps: List[Tuple[float, int]], expected_duration: float):
+        """Apply completion beep selection and update the selected frame range."""
+        if not completion_beeps:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Audio Detection",
+                "No completion beeps detected in the audio. Try adjusting audio parameters or check if the video has audio.",
+            )
+            self.results_label.setText("Audio Detection: No completion beeps found.")
+            return
+
+        if len(completion_beeps) == 1:
+            selected_beep_time, selected_end_frame = completion_beeps[0]
+        else:
+            beep_options = [
+                f"Beep {i + 1}: {beep_time:.1f}s (Frame {frame_num + 1})"
+                for i, (beep_time, frame_num) in enumerate(completion_beeps)
+            ]
+            selected_option, ok = QtWidgets.QInputDialog.getItem(
+                self,
+                "Audio Detection",
+                f"Found {len(completion_beeps)} completion beeps. Select which one to use:",
+                beep_options,
+                0,
+                False,
+            )
+            if not ok:
+                self.results_label.setText("Audio Detection: User cancelled selection.")
+                return
+            selected_index = beep_options.index(selected_option)
+            selected_beep_time, selected_end_frame = completion_beeps[selected_index]
+
+        cap = cv2.VideoCapture(self.video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+
+        if fps <= 0:
+            QtWidgets.QMessageBox.critical(self, "Error", "Could not determine video frame rate.")
+            return
+
+        start_time = selected_beep_time - expected_duration
+        calculated_start_frame = max(0, int(start_time * fps))
+        calculated_end_frame = min(selected_end_frame, total_frames - 1)
+        calculated_start_frame = min(calculated_start_frame, calculated_end_frame)
+
+        before = self._capture_editor_snapshot()
+        changed = self._apply_analysis_range(
+            calculated_start_frame,
+            calculated_end_frame,
+            result_message=(
+                f"✅ Audio-detected range: Frame {calculated_start_frame + 1} to {calculated_end_frame + 1} "
+                f"(Duration: {((calculated_end_frame - calculated_start_frame) + 1) / fps:.1f}s, "
+                f"Expected: {expected_duration:.1f}s)"
+            ),
+            seek_to_frame=calculated_start_frame,
+        )
+        if changed:
+            self._record_history_change("Auto-Detect Analysis Window", before)
+
+        actual_duration = (self.end_frame - self.start_frame + 1) / fps
+        self.results_label.setText(
+            f"✅ Audio-detected range: Frame {self.start_frame + 1} to {self.end_frame + 1} "
+            f"(Duration: {actual_duration:.1f}s, Expected: {expected_duration:.1f}s)"
+        )
+
+        duration_difference = abs(actual_duration - expected_duration)
+        if duration_difference <= expected_duration * 0.1:
+            self.audio_manager.play_run_detected()
+
+    def _on_audio_detection_finished(self, completion_beeps: List[Tuple[float, int]]):
+        """Handle successful completion of audio detection worker."""
+        expected_duration = self._pending_audio_expected_duration
+        self._cleanup_audio_worker()
+        self._apply_audio_detection_results(completion_beeps, expected_duration)
+
+    def _on_audio_detection_error(self, message: str):
+        """Handle worker audio-detection errors."""
+        self._cleanup_audio_worker()
+        QtWidgets.QMessageBox.critical(self, "Audio Detection Error", f"An error occurred during audio analysis:\n{message}")
+        self.results_label.setText(f"Audio Detection failed: {message}")
+        logging.error("Audio detection error: %s", message)
+
+    def _on_audio_detection_cancelled(self):
+        """Handle audio detection cancellation."""
+        self._cleanup_audio_worker()
+        self.results_label.setText("Audio Detection cancelled.")
+
+    def _cleanup_audio_worker(self):
+        """Tear down audio worker resources safely."""
+        if self._audio_progress is not None:
+            self._audio_progress.close()
+            self._audio_progress = None
+
+        if self._audio_thread is not None:
+            self._audio_thread.quit()
+            self._audio_thread.wait(1500)
+            self._audio_thread = None
+
+        self._audio_worker = None
+        self._pending_audio_expected_duration = 0.0
+        self._set_busy_state(False)
+
+
+    # --- Analysis and Plotting ---
+
+    def _selected_export_options(self) -> ExportOptions:
+        """Read export choices from the UI."""
+        return ExportOptions(
+            csv=self.export_csv_checkbox.isChecked(),
+            json=self.export_json_checkbox.isChecked(),
+            plot=self.export_plot_checkbox.isChecked(),
+            interactive_plot=self.export_interactive_checkbox.isChecked(),
+        )
+
+    def analyze_video(self):
+        """Dispatch brightness analysis to a background worker."""
+        if self._analysis_in_progress:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Busy",
+                "Please wait for the current task to complete or cancel it first.",
+            )
+            return
+
+        if not self.video_path:
+            QtWidgets.QMessageBox.warning(self, "Analysis Error", "Please load a video file first.")
+            return
+        if not self.rects:
+            QtWidgets.QMessageBox.warning(self, "Analysis Error", "Please define at least one ROI.")
+            return
+        if self.start_frame is None or self.end_frame is None or self.start_frame > self.end_frame:
+            QtWidgets.QMessageBox.warning(self, "Analysis Error", "Invalid start/end frame range selected.")
+            return
+
+        export_options = self._selected_export_options()
+        if not export_options.has_outputs():
+            QtWidgets.QMessageBox.warning(self, "Export Options", "Please select at least one export output.")
+            self.side_tabs.setCurrentWidget(self.export_tab)
+            return
+
+        initial_dir = os.path.dirname(self.video_path) if self.video_path else ""
+        save_dir = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Choose Directory to Save Analysis Results and Plots", initial_dir
+        )
+        if not save_dir:
+            self.results_label.setText("Analysis cancelled (no save directory chosen).")
+            return
+
+        rects_snapshot = [((int(pt1[0]), int(pt1[1])), (int(pt2[0]), int(pt2[1]))) for pt1, pt2 in self.rects]
+        fixed_masks_snapshot: List[Optional[np.ndarray]] = []
+        for mask in self.fixed_roi_masks:
+            if isinstance(mask, np.ndarray):
+                fixed_masks_snapshot.append(mask.copy())
+            else:
+                fixed_masks_snapshot.append(None)
+
+        request = AnalysisRequest(
+            video_path=self.video_path,
+            rects=rects_snapshot,
+            background_roi_idx=self.background_roi_idx,
+            start_frame=self.start_frame,
+            end_frame=self.end_frame,
+            use_fixed_mask=self.use_fixed_mask,
+            fixed_roi_masks=fixed_masks_snapshot,
+            background_percentile=self.background_percentile,
+            morphological_kernel_size=self.morphological_kernel_size,
+            noise_floor_threshold=self.noise_floor_threshold,
+        )
+
+        self._analysis_save_dir = save_dir
+        self._pending_export_options = export_options
+        self._set_busy_state(True)
+        self.stop_playback()
+        self.results_label.setText("⚙️ Initializing analysis...")
+        self.brightness_display_label.setText("📊 Preparing...")
+        self.audio_manager.play_analysis_start()
+        self.statusBar().showMessage("🔍 Starting brightness analysis...")
+        num_frames_to_analyze = request.end_frame - request.start_frame + 1
+        non_background_rois = [i for i in range(len(request.rects)) if i != request.background_roi_idx]
+        progress = QtWidgets.QProgressDialog(
+            f"🔍 Analyzing {num_frames_to_analyze} video frames...\n"
+            f"ROIs: {len(non_background_rois)} | Frames: {request.start_frame + 1}-{request.end_frame + 1}",
+            "Cancel",
+            0,
+            num_frames_to_analyze,
+            self,
+        )
+        progress.setWindowModality(QtCore.Qt.WindowModal)
+        progress.setWindowTitle("📊 Brightness Analysis")
+        progress.setMinimumWidth(420)
+        progress.setValue(0)
+        progress.canceled.connect(self._cancel_active_worker)
+        progress.show()
+        self._analysis_progress = progress
+
+        self._analysis_thread = QtCore.QThread()
+        self._analysis_worker = AnalysisWorker(request)
+        self._analysis_worker.moveToThread(self._analysis_thread)
+        self._analysis_thread.started.connect(self._analysis_worker.run)
+        self._analysis_worker.progress_changed.connect(self._on_analysis_worker_progress)
+        self._analysis_worker.progress_message.connect(self._on_analysis_worker_message)
+        self._analysis_worker.finished.connect(self._on_analysis_worker_finished)
+        self._analysis_worker.error.connect(self._on_analysis_worker_error)
+        self._analysis_worker.cancelled.connect(self._on_analysis_worker_cancelled)
+        self._analysis_thread.start()
+
+    def _on_analysis_worker_progress(self, current: int, total: int):
+        """Update analysis progress dialog value."""
+        if self._analysis_progress is not None:
+            self._analysis_progress.setMaximum(total)
+            self._analysis_progress.setValue(current)
+
+    def _on_analysis_worker_message(self, message: str):
+        """Update analysis progress details."""
+        if self._analysis_progress is not None:
+            self._analysis_progress.setLabelText(message)
+        self.statusBar().showMessage(message)
+
+    def _on_analysis_worker_finished(self, result_obj: object):
+        """Handle successful completion of the analysis worker."""
+        result = result_obj if isinstance(result_obj, AnalysisResult) else None
+        self._cleanup_analysis_worker(reset_busy=False)
+
+        if result is None:
+            self.results_label.setText("Analysis failed: invalid worker result.")
+            self._pending_export_options = None
+            self._set_busy_state(False)
+            return
+
+        if result.frames_processed == 0:
+            QtWidgets.QMessageBox.warning(self, "Analysis", "No frames were processed during analysis.")
+            self.results_label.setText("Analysis completed, but no frames processed.")
+            self._update_current_brightness_display()
+            self._pending_export_options = None
+            self._set_busy_state(False)
+            return
+
+        if self._analysis_save_dir is None:
+            self.results_label.setText("Analysis failed: missing save directory.")
+            self._pending_export_options = None
+            self._set_busy_state(False)
+            return
+
+        export_options = self._pending_export_options or ExportOptions()
+        self._save_analysis_results(result, self._analysis_save_dir, export_options)
+        self._analysis_save_dir = None
+        self._pending_export_options = None
+        self.statusBar().showMessage("Analysis complete")
+        self.audio_manager.play_analysis_complete()
+
+        expected_duration = self.run_duration_spin.value()
+        if expected_duration > 0.0 and self.start_frame is not None and self.end_frame is not None:
+            confidence = self._validate_run_duration(self.start_frame, self.end_frame, expected_duration)
+            if confidence >= 0.8:
+                self.audio_manager.play_run_detected()
+
+        self._set_busy_state(False)
+
+    def _on_analysis_worker_error(self, message: str):
+        """Handle worker analysis failure."""
+        self._cleanup_analysis_worker()
+        self._analysis_save_dir = None
+        self._pending_export_options = None
+        QtWidgets.QMessageBox.critical(self, "Analysis Error", f"An error occurred during analysis:\n{message}")
+        self.results_label.setText(f"Analysis failed: {message}")
+        logging.error("Analysis error: %s", message)
+
+    def _on_analysis_worker_cancelled(self):
+        """Handle analysis cancellation."""
+        self._cleanup_analysis_worker()
+        self._analysis_save_dir = None
+        self._pending_export_options = None
+        self.results_label.setText("Analysis cancelled by user.")
+        self._update_current_brightness_display()
+
+    def _cleanup_analysis_worker(self, reset_busy: bool = True):
+        """Tear down analysis worker resources safely."""
+        if self._analysis_progress is not None:
+            self._analysis_progress.close()
+            self._analysis_progress = None
+
+        if self._analysis_thread is not None:
+            self._analysis_thread.quit()
+            self._analysis_thread.wait(1500)
+            self._analysis_thread = None
+
+        self._analysis_worker = None
+
+        if reset_busy:
+            self._set_busy_state(False)
+
+    def _save_analysis_results(self, analysis_result: AnalysisResult, save_dir: str, export_options: ExportOptions):
+        """Save analysis results and generate plots through export helpers."""
+        if self.video_path is None:
+            return
+
+        self.out_paths = []
+        analysis_name = self.analysis_name_input.text().strip() or "DefaultAnalysis"
+        progress_label = "Saving selected export outputs..."
+
+        progress = QtWidgets.QProgressDialog(
+            progress_label,
+            "Cancel",
+            0,
+            max(1, len(analysis_result.brightness_mean_data)),
+            self,
+        )
+        progress.setWindowModality(QtCore.Qt.WindowModal)
+        progress.setWindowTitle("Saving Results")
+        progress.setValue(0)
+        progress.show()
+        QtWidgets.QApplication.processEvents()
+
+        def _progress_callback(current: int, total: int) -> bool:
+            if progress.wasCanceled():
+                return False
+            progress.setMaximum(max(1, total))
+            progress.setValue(current)
+            QtWidgets.QApplication.processEvents()
+            return True
+
+        export_result = save_analysis_outputs(
+            analysis_result=analysis_result,
+            save_dir=save_dir,
+            video_path=self.video_path,
+            analysis_name=analysis_name,
+            plot_builder=self._generate_enhanced_plot,
+            export_options=export_options,
+            progress_callback=_progress_callback,
+        )
+        progress.close()
+
+        self.out_paths = export_result.out_paths
+        summary_lines = export_result.summary_lines
+        if export_result.plot_failed:
+            summary_lines.append("Note: Some plots failed to generate - check console for details")
+        if export_result.cancelled:
+            summary_lines.append("Note: Export cancelled by user before all ROIs were written")
+
+        self.results_label.setText("\n".join(summary_lines))
+        self.brightness_display_label.setText(
+            ", ".join(export_result.avg_brightness_summary) if export_result.avg_brightness_summary else "N/A"
+        )
+
+    def _generate_enhanced_plot(
+        self,
+        df,
+        base_filename,
+        save_dir,
+        r_idx,
+        analysis_name,
+        base_video_name,
+        background_values_per_frame,
+        generate_static=True,
+        generate_interactive=True,
+    ):
+        """Generate enhanced plots and an interactive visualization for the ROI."""
+        png_path: Optional[str] = None
+        interactive_path: Optional[str] = None
+        try:
+            frames = df['frame']
+            brightness_mean = df['brightness_mean']
+            brightness_median = df['brightness_median']
+            blue_mean = df['blue_mean']
+            blue_median = df['blue_median']
+
+            if brightness_mean.empty:
+                return png_path, interactive_path
+
+            # Statistics
+            idx_peak_mean = brightness_mean.idxmax()
+            frame_peak_mean, val_peak_mean = frames.iloc[idx_peak_mean], brightness_mean.iloc[idx_peak_mean]
+            mean_of_means = brightness_mean.mean()
+            std_of_means = brightness_mean.std()
+            
+            idx_peak_median = brightness_median.idxmax()
+            frame_peak_median, val_peak_median = frames.iloc[idx_peak_median], brightness_median.iloc[idx_peak_median]
+            mean_of_medians = brightness_median.mean()
+            std_of_medians = brightness_median.std()
+            
+            # Blue channel statistics
+            idx_peak_blue_mean = blue_mean.idxmax()
+            frame_peak_blue_mean, val_peak_blue_mean = frames.iloc[idx_peak_blue_mean], blue_mean.iloc[idx_peak_blue_mean]
+            mean_of_blue_means = blue_mean.mean()
+            std_of_blue_means = blue_mean.std()
+            
+            idx_peak_blue_median = blue_median.idxmax()
+            frame_peak_blue_median, val_peak_blue_median = frames.iloc[idx_peak_blue_median], blue_median.iloc[idx_peak_blue_median]
+            mean_of_blue_medians = blue_median.mean()
+            std_of_blue_medians = blue_median.std()
+
+            frame_list = frames.tolist()
+            brightness_mean_values = brightness_mean.tolist()
+            brightness_median_values = brightness_median.tolist()
+            blue_mean_values = blue_mean.tolist()
+            blue_median_values = blue_median.tolist()
+
+            background_array: Optional[np.ndarray] = None
+            if background_values_per_frame and len(background_values_per_frame) == len(frames):
+                candidate_background = np.array(background_values_per_frame)
+                valid_background_mask = candidate_background > 0
+                if np.any(valid_background_mask):
+                    background_array = candidate_background
+
+            if generate_static:
+                # Create enhanced plot with dual subplots
+                import matplotlib.pyplot as plt
+
+                plt.style.use('seaborn-v0_8-darkgrid')
+                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+
+                # Main brightness plot
+                ax1.plot(frames, brightness_mean, label='Mean Brightness', color='#5a9bd5', linewidth=2, alpha=0.8)
+                ax1.plot(frames, brightness_median, label='Median Brightness', color='#70ad47', linewidth=2, alpha=0.8)
+            
+                # Add background line if background values are available
+                if background_array is not None:
+                    ax1.plot(frames, background_array, label='Background Level', color='#808080', 
+                             linewidth=1.5, linestyle=':', alpha=0.9)
+            
+                # Add confidence bands (mean ± std)
+                ax1.fill_between(frames, brightness_mean - std_of_means, brightness_mean + std_of_means, 
+                                 alpha=0.2, color='#5a9bd5', label=f'Mean ±1σ ({std_of_means:.1f})')
+                ax1.fill_between(frames, brightness_median - std_of_medians, brightness_median + std_of_medians, 
+                                 alpha=0.2, color='#70ad47', label=f'Median ±1σ ({std_of_medians:.1f})')
+            
+                # Add horizontal lines for averages
+                ax1.axhline(mean_of_means, color='#5a9bd5', linestyle='--', alpha=0.7, 
+                            label=f'Avg Mean ({mean_of_means:.1f})')
+                ax1.axhline(mean_of_medians, color='#70ad47', linestyle='--', alpha=0.7, 
+                            label=f'Avg Median ({mean_of_medians:.1f})')
+            
+                # Mark peak points
+                ax1.scatter([frame_peak_mean], [val_peak_mean], color='#ff0000', zorder=5, s=100, 
+                            marker='^', label=f'Peak Mean ({val_peak_mean:.1f})')
+                ax1.scatter([frame_peak_median], [val_peak_median], color='#ed7d31', zorder=5, s=100, 
+                            marker='v', label=f'Peak Median ({val_peak_median:.1f})')
+
+                ax1.set_title(f"{analysis_name} - {base_video_name} - ROI {r_idx+1}", fontsize=16, fontweight='bold')
+                ax1.set_ylabel('L* Brightness', fontsize=12)
+                ax1.legend(fontsize=10, loc='best')
+                ax1.grid(True, alpha=0.3)
+            
+                # Adjust y-axis limits to provide more space at the top for statistics panel
+                y_min, y_max = ax1.get_ylim()
+                y_range = y_max - y_min
+                ax1.set_ylim(y_min, y_max + 0.15 * y_range)
+
+                # Add statistics text box
+                stats_text = f"""Statistics:
+Mean: {mean_of_means:.2f} ± {std_of_means:.2f}
+Median: {mean_of_medians:.2f} ± {std_of_medians:.2f}
+Peak Mean: {val_peak_mean:.2f} @ Frame {frame_peak_mean}
+Peak Median: {val_peak_median:.2f} @ Frame {frame_peak_median}
+Frames Analyzed: {len(frames)}"""
+            
+                ax1.text(0.98, 0.98, stats_text, transform=ax1.transAxes, fontsize=9,
+                         verticalalignment='top', horizontalalignment='right', 
+                         bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+            
+                # Blue channel plot
+                ax2.plot(frames, blue_mean, label='Blue Mean', color='#0066cc', linewidth=2, alpha=0.8)
+                ax2.plot(frames, blue_median, label='Blue Median', color='#3399ff', linewidth=2, alpha=0.8)
+            
+                # Add confidence bands for blue channel
+                ax2.fill_between(frames, blue_mean - std_of_blue_means, blue_mean + std_of_blue_means, 
+                                 alpha=0.2, color='#0066cc', label=f'Blue Mean ±1σ ({std_of_blue_means:.1f})')
+                ax2.fill_between(frames, blue_median - std_of_blue_medians, blue_median + std_of_blue_medians, 
+                                 alpha=0.2, color='#3399ff', label=f'Blue Median ±1σ ({std_of_blue_medians:.1f})')
+            
+                # Add horizontal lines for blue averages
+                ax2.axhline(mean_of_blue_means, color='#0066cc', linestyle='--', alpha=0.7, 
+                            label=f'Avg Blue Mean ({mean_of_blue_means:.1f})')
+                ax2.axhline(mean_of_blue_medians, color='#3399ff', linestyle='--', alpha=0.7, 
+                            label=f'Avg Blue Median ({mean_of_blue_medians:.1f})')
+            
+                # Mark blue peak points
+                ax2.scatter([frame_peak_blue_mean], [val_peak_blue_mean], color='#ff0000', zorder=5, s=100, 
+                            marker='^', label=f'Peak Blue Mean ({val_peak_blue_mean:.1f})')
+                ax2.scatter([frame_peak_blue_median], [val_peak_blue_median], color='#ed7d31', zorder=5, s=100, 
+                            marker='v', label=f'Peak Blue Median ({val_peak_blue_median:.1f})')
+            
+                ax2.set_xlabel('Frame Number', fontsize=12)
+                ax2.set_ylabel('Blue Channel Value', fontsize=12)
+                ax2.legend(fontsize=10, loc='best')
+                ax2.grid(True, alpha=0.3)
+            
+                # Add blue channel statistics text box
+                blue_stats_text = f"""Blue Channel Statistics:
+Mean: {mean_of_blue_means:.1f} ± {std_of_blue_means:.1f}
+Median: {mean_of_blue_medians:.1f} ± {std_of_blue_medians:.1f}
+Peak Mean: {val_peak_blue_mean:.1f} @ Frame {frame_peak_blue_mean}
+Peak Median: {val_peak_blue_median:.1f} @ Frame {frame_peak_blue_median}"""
+            
+                ax2.text(0.98, 0.98, blue_stats_text, transform=ax2.transAxes, fontsize=9,
+                         verticalalignment='top', horizontalalignment='right', 
+                         bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+
+                plt.tight_layout()
+
+                # Save plot
+                plot_filename = f"{base_filename}_plot.png"
+                plot_save_path = os.path.join(save_dir, plot_filename)
+                plt.savefig(plot_save_path, dpi=300, bbox_inches='tight')
+                plt.close(fig)
+                png_path = plot_save_path
+
+            if generate_interactive:
+                plotly_go, plotly_make_subplots = get_plotly()
+                if plotly_go is not None and plotly_make_subplots is not None:
+                    try:
+                        interactive_filename = f"{base_filename}_interactive.html"
+                        interactive_save_path = os.path.join(save_dir, interactive_filename)
+
+                        fig_interactive = plotly_make_subplots(
+                            rows=2,
+                            cols=1,
+                            shared_xaxes=True,
+                            vertical_spacing=0.1,
+                            subplot_titles=("L* Brightness", "Blue Channel")
+                        )
+                        selection_fill = _hex_to_rgba(COLOR_ACCENT, 0.18)
+
+                        # L* mean confidence band
+                        upper_mean_band = (brightness_mean + std_of_means).tolist()
+                        lower_mean_band = (brightness_mean - std_of_means).tolist()
+                        fig_interactive.add_trace(
+                            plotly_go.Scatter(
+                                x=frame_list,
+                                y=upper_mean_band,
+                                mode='lines',
+                                line=dict(width=0),
+                                showlegend=False,
+                                hoverinfo='skip'
+                            ),
+                            row=1,
+                            col=1
+                        )
+                        fig_interactive.add_trace(
+                            plotly_go.Scatter(
+                                x=frame_list,
+                                y=lower_mean_band,
+                                mode='lines',
+                                line=dict(width=0),
+                                showlegend=True,
+                                name=f"Mean ±1σ ({std_of_means:.1f})",
+                                fill='tonexty',
+                                fillcolor='rgba(90,155,213,0.25)',
+                                hoverinfo='skip'
+                            ),
+                            row=1,
+                            col=1
+                        )
+
+                        # Median confidence band
+                        upper_median_band = (brightness_median + std_of_medians).tolist()
+                        lower_median_band = (brightness_median - std_of_medians).tolist()
+                        fig_interactive.add_trace(
+                            plotly_go.Scatter(
+                                x=frame_list,
+                                y=upper_median_band,
+                                mode='lines',
+                                line=dict(width=0),
+                                showlegend=False,
+                                hoverinfo='skip'
+                            ),
+                            row=1,
+                            col=1
+                        )
+                        fig_interactive.add_trace(
+                            plotly_go.Scatter(
+                                x=frame_list,
+                                y=lower_median_band,
+                                mode='lines',
+                                line=dict(width=0),
+                                showlegend=True,
+                                name=f"Median ±1σ ({std_of_medians:.1f})",
+                                fill='tonexty',
+                                fillcolor='rgba(112,173,71,0.25)',
+                                hoverinfo='skip'
+                            ),
+                            row=1,
+                            col=1
+                        )
+
+                        # Brightness lines
+                        fig_interactive.add_trace(
+                            plotly_go.Scatter(
+                                x=frame_list,
+                                y=brightness_mean_values,
+                                mode='lines',
+                                name='Mean Brightness',
+                                line=dict(color='#5a9bd5', width=2),
+                                hovertemplate="Frame %{x}<br>Mean L*: %{y:.2f}<extra></extra>"
+                            ),
+                            row=1,
+                            col=1
+                        )
+                        fig_interactive.add_trace(
+                            plotly_go.Scatter(
+                                x=frame_list,
+                                y=brightness_median_values,
+                                mode='lines',
+                                name='Median Brightness',
+                                line=dict(color='#70ad47', width=2),
+                                hovertemplate="Frame %{x}<br>Median L*: %{y:.2f}<extra></extra>"
+                            ),
+                            row=1,
+                            col=1
+                        )
+
+                        # Background level
+                        if background_array is not None:
+                            fig_interactive.add_trace(
+                                plotly_go.Scatter(
+                                    x=frame_list,
+                                    y=background_array.tolist(),
+                                    mode='lines',
+                                    name='Background Level',
+                                    line=dict(color='#808080', width=1.5, dash='dot'),
+                                    hovertemplate="Frame %{x}<br>Background L*: %{y:.2f}<extra></extra>"
+                                ),
+                                row=1,
+                                col=1
+                            )
+
+                        # Peak annotations
+                        fig_interactive.add_trace(
+                            plotly_go.Scatter(
+                                x=[frame_peak_mean],
+                                y=[val_peak_mean],
+                                mode='markers',
+                                name=f'Peak Mean ({val_peak_mean:.1f})',
+                                marker=dict(color='#ff0000', size=10, symbol='triangle-up'),
+                                hovertemplate="Frame %{x}<br>Peak Mean L*: %{y:.2f}<extra></extra>"
+                            ),
+                            row=1,
+                            col=1
+                        )
+                        fig_interactive.add_trace(
+                            plotly_go.Scatter(
+                                x=[frame_peak_median],
+                                y=[val_peak_median],
+                                mode='markers',
+                                name=f'Peak Median ({val_peak_median:.1f})',
+                                marker=dict(color='#ed7d31', size=10, symbol='triangle-down'),
+                                hovertemplate="Frame %{x}<br>Peak Median L*: %{y:.2f}<extra></extra>"
+                            ),
+                            row=1,
+                            col=1
+                        )
+                        fig_interactive.add_trace(
+                            plotly_go.Scatter(
+                                x=[frame_peak_mean],
+                                y=[val_peak_mean],
+                                mode='markers',
+                                name='Selected Range Peak (L*)',
+                                marker=dict(
+                                    color=COLOR_WARNING,
+                                    size=14,
+                                    symbol='star',
+                                    line=dict(color='#92400e', width=1.2)
+                                ),
+                                hovertemplate="Frame %{x}<br>Selected L* Peak: %{y:.2f}<extra></extra>"
+                            ),
+                            row=1,
+                            col=1
+                        )
+
+                        # Horizontal averages
+                        fig_interactive.add_trace(
+                            plotly_go.Scatter(
+                                x=frame_list,
+                                y=[mean_of_means] * len(frame_list),
+                                mode='lines',
+                                name=f'Avg Mean ({mean_of_means:.1f})',
+                                line=dict(color='#5a9bd5', dash='dash'),
+                                hoverinfo='skip'
+                            ),
+                            row=1,
+                            col=1
+                        )
+                        fig_interactive.add_trace(
+                            plotly_go.Scatter(
+                                x=frame_list,
+                                y=[mean_of_medians] * len(frame_list),
+                                mode='lines',
+                                name=f'Avg Median ({mean_of_medians:.1f})',
+                                line=dict(color='#70ad47', dash='dash'),
+                                hoverinfo='skip'
+                            ),
+                            row=1,
+                            col=1
+                        )
+
+                        # Blue channel confidence bands
+                        upper_blue_mean_band = (blue_mean + std_of_blue_means).tolist()
+                        lower_blue_mean_band = (blue_mean - std_of_blue_means).tolist()
+                        fig_interactive.add_trace(
+                            plotly_go.Scatter(
+                                x=frame_list,
+                                y=upper_blue_mean_band,
+                                mode='lines',
+                                line=dict(width=0),
+                                showlegend=False,
+                                hoverinfo='skip'
+                            ),
+                            row=2,
+                            col=1
+                        )
+                        fig_interactive.add_trace(
+                            plotly_go.Scatter(
+                                x=frame_list,
+                                y=lower_blue_mean_band,
+                                mode='lines',
+                                line=dict(width=0),
+                                showlegend=True,
+                                name=f'Blue Mean ±1σ ({std_of_blue_means:.1f})',
+                                fill='tonexty',
+                                fillcolor='rgba(0,102,204,0.25)',
+                                hoverinfo='skip'
+                            ),
+                            row=2,
+                            col=1
+                        )
+
+                        upper_blue_median_band = (blue_median + std_of_blue_medians).tolist()
+                        lower_blue_median_band = (blue_median - std_of_blue_medians).tolist()
+                        fig_interactive.add_trace(
+                            plotly_go.Scatter(
+                                x=frame_list,
+                                y=upper_blue_median_band,
+                                mode='lines',
+                                line=dict(width=0),
+                                showlegend=False,
+                                hoverinfo='skip'
+                            ),
+                            row=2,
+                            col=1
+                        )
+                        fig_interactive.add_trace(
+                            plotly_go.Scatter(
+                                x=frame_list,
+                                y=lower_blue_median_band,
+                                mode='lines',
+                                line=dict(width=0),
+                                showlegend=True,
+                                name=f'Blue Median ±1σ ({std_of_blue_medians:.1f})',
+                                fill='tonexty',
+                                fillcolor='rgba(51,153,255,0.25)',
+                                hoverinfo='skip'
+                            ),
+                            row=2,
+                            col=1
+                        )
+
+                        # Blue channel lines
+                        fig_interactive.add_trace(
+                            plotly_go.Scatter(
+                                x=frame_list,
+                                y=blue_mean_values,
+                                mode='lines',
+                                name='Blue Mean',
+                                line=dict(color='#0066cc', width=2),
+                                hovertemplate="Frame %{x}<br>Blue Mean: %{y:.2f}<extra></extra>"
+                            ),
+                            row=2,
+                            col=1
+                        )
+                        fig_interactive.add_trace(
+                            plotly_go.Scatter(
+                                x=frame_list,
+                                y=blue_median_values,
+                                mode='lines',
+                                name='Blue Median',
+                                line=dict(color='#3399ff', width=2),
+                                hovertemplate="Frame %{x}<br>Blue Median: %{y:.2f}<extra></extra>"
+                            ),
+                            row=2,
+                            col=1
+                        )
+
+                        # Blue channel peaks
+                        fig_interactive.add_trace(
+                            plotly_go.Scatter(
+                                x=[frame_peak_blue_mean],
+                                y=[val_peak_blue_mean],
+                                mode='markers',
+                                name=f'Peak Blue Mean ({val_peak_blue_mean:.1f})',
+                                marker=dict(color='#ff0000', size=10, symbol='triangle-up'),
+                                hovertemplate="Frame %{x}<br>Peak Blue Mean: %{y:.2f}<extra></extra>"
+                            ),
+                            row=2,
+                            col=1
+                        )
+                        fig_interactive.add_trace(
+                            plotly_go.Scatter(
+                                x=[frame_peak_blue_median],
+                                y=[val_peak_blue_median],
+                                mode='markers',
+                                name=f'Peak Blue Median ({val_peak_blue_median:.1f})',
+                                marker=dict(color='#ed7d31', size=10, symbol='triangle-down'),
+                                hovertemplate="Frame %{x}<br>Peak Blue Median: %{y:.2f}<extra></extra>"
+                            ),
+                            row=2,
+                            col=1
+                        )
+                        fig_interactive.add_trace(
+                            plotly_go.Scatter(
+                                x=[frame_peak_blue_mean],
+                                y=[val_peak_blue_mean],
+                                mode='markers',
+                                name='Selected Range Peak (Blue)',
+                                marker=dict(
+                                    color=COLOR_INFO,
+                                    size=14,
+                                    symbol='star',
+                                    line=dict(color='#0e7490', width=1.2)
+                                ),
+                                hovertemplate="Frame %{x}<br>Selected Blue Peak: %{y:.2f}<extra></extra>"
+                            ),
+                            row=2,
+                            col=1
+                        )
+
+                        # Blue channel averages
+                        fig_interactive.add_trace(
+                            plotly_go.Scatter(
+                                x=frame_list,
+                                y=[mean_of_blue_means] * len(frame_list),
+                                mode='lines',
+                                name=f'Avg Blue Mean ({mean_of_blue_means:.1f})',
+                                line=dict(color='#0066cc', dash='dash'),
+                                hoverinfo='skip'
+                            ),
+                            row=2,
+                            col=1
+                        )
+                        fig_interactive.add_trace(
+                            plotly_go.Scatter(
+                                x=frame_list,
+                                y=[mean_of_blue_medians] * len(frame_list),
+                                mode='lines',
+                                name=f'Avg Blue Median ({mean_of_blue_medians:.1f})',
+                                line=dict(color='#3399ff', dash='dash'),
+                                hoverinfo='skip'
+                            ),
+                            row=2,
+                            col=1
+                        )
+
+                        # Layout
+                        fig_interactive.update_layout(
+                            title=f"{analysis_name} - {base_video_name} - ROI {r_idx+1}",
+                            height=820,
+                            dragmode='select',
+                            selectdirection='h',
+                            hovermode='x unified',
+                            template='plotly_white',
+                            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1.0),
+                            margin=dict(t=80, b=60, l=60, r=30),
+                            newselection=dict(
+                                line=dict(color=COLOR_ACCENT, width=2)
+                            )
+                        )
+                        fig_interactive.update_xaxes(title_text="Frame Number", row=2, col=1)
+                        fig_interactive.update_yaxes(title_text="L* Brightness", row=1, col=1)
+                        fig_interactive.update_yaxes(title_text="Blue Channel Value", row=2, col=1)
+
+                        # Summary annotation
+                        fig_interactive.add_annotation(
+                            text=(
+                                f"Mean: {mean_of_means:.2f} ± {std_of_means:.2f} | "
+                                f"Median: {mean_of_medians:.2f} ± {std_of_medians:.2f}<br>"
+                                f"Blue Mean: {mean_of_blue_means:.1f} ± {std_of_blue_means:.1f} | "
+                                f"Blue Median: {mean_of_blue_medians:.1f} ± {std_of_blue_medians:.1f}"
+                            ),
+                            xref="paper",
+                            yref="paper",
+                            x=0.0,
+                            y=1.12,
+                            showarrow=False,
+                            align='left',
+                            font=dict(size=12),
+                            bgcolor='rgba(255,255,255,0.8)',
+                            bordercolor='#cccccc',
+                            borderwidth=1,
+                            borderpad=6
+                        )
+
+                        div_id = f"roi-interactive-{r_idx+1}"
+                        selection_script = self._build_selection_post_script(
+                            div_id=div_id,
+                            frames=frame_list,
+                            brightness_values=brightness_mean_values,
+                            blue_values=blue_mean_values,
+                            accent_color=COLOR_ACCENT,
+                            selection_fill=selection_fill,
+                        )
+                        fig_interactive.write_html(
+                            interactive_save_path,
+                            include_plotlyjs='cdn',
+                            div_id=div_id,
+                            post_script=selection_script,
+                        )
+                        interactive_path = interactive_save_path
+
+                        try:
+                            opened = QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(interactive_save_path))
+                            if not opened:
+                                logging.warning("Could not automatically open interactive plot %s", interactive_save_path)
+                        except Exception as exc:
+                            logging.warning("Could not automatically open interactive plot %s: %s", interactive_save_path, exc)
+                    except Exception as plotly_error:
+                        logging.warning(f"Failed to generate interactive plot for ROI {r_idx+1}: {plotly_error}")
+                else:
+                    logging.info("Plotly not available - skipping interactive plot generation.")
+
+            return png_path, interactive_path
+
+        except Exception as e:
+            logging.error(f"Failed to generate plot for ROI {r_idx+1}: {e}")
+            raise
+
+    def _build_selection_post_script(
+        self,
+        div_id: str,
+        frames: List[float],
+        brightness_values: List[float],
+        blue_values: List[float],
+        accent_color: str,
+        selection_fill: str,
+    ) -> str:
+        """Generate a JS snippet that highlights peaks inside the active brush selection."""
+        frames_json = json.dumps(frames)
+        brightness_json = json.dumps(brightness_values)
+        blue_json = json.dumps(blue_values)
+        font_family = DEFAULT_FONT_FAMILY.replace("\\", "\\\\").replace("'", "\\'")
+        accent_color = accent_color.replace("\\", "\\\\").replace("'", "\\'")
+        selection_fill = selection_fill.replace("\\", "\\\\").replace("'", "\\'")
+
+        script = Template(
+            "(function() {\n"
+            "  const divId = '$div_id';\n"
+            "  const frames = $frames_json;\n"
+            "  const brightnessValues = $brightness_json;\n"
+            "  const blueValues = $blue_json;\n"
+            "  const accentColor = '$accent_color';\n"
+            "  const selectionFill = '$selection_fill';\n"
+            "  const fontFamily = '$font_family';\n"
+            "\n"
+            "  const createSelectionEnhancements = () => {\n"
+            "    const gd = document.getElementById(divId);\n"
+            "    if (!gd || gd.__selectionInitialized) {\n"
+            "      return;\n"
+            "    }\n"
+            "\n"
+            "    const initialiseWhenReady = () => {\n"
+            "      if (typeof Plotly === 'undefined') {\n"
+            "        return false;\n"
+            "      }\n"
+            "      if (!gd.data || !gd.data.length) {\n"
+            "        return false;\n"
+            "      }\n"
+            "\n"
+            "      const selectedMeanIndex = gd.data.findIndex(trace => trace.name === 'Selected Range Peak (L*)');\n"
+            "      const selectedBlueIndex = gd.data.findIndex(trace => trace.name === 'Selected Range Peak (Blue)');\n"
+            "      if (selectedMeanIndex === -1 || selectedBlueIndex === -1) {\n"
+            "        return false;\n"
+            "      }\n"
+            "\n"
+            "      gd.__selectionInitialized = true;\n"
+            "\n"
+            "      const infoPanel = document.createElement('div');\n"
+            "      infoPanel.className = 'selection-info';\n"
+            "      infoPanel.style.marginTop = '12px';\n"
+            "      infoPanel.style.fontFamily = fontFamily;\n"
+            "      infoPanel.style.fontSize = '14px';\n"
+            "      infoPanel.style.color = '#1f2937';\n"
+            "      infoPanel.style.background = 'rgba(255,255,255,0.92)';\n"
+            "      infoPanel.style.border = '1px solid #e5e7eb';\n"
+            "      infoPanel.style.borderRadius = '8px';\n"
+            "      infoPanel.style.padding = '8px 12px';\n"
+            "      infoPanel.style.boxShadow = '0 1px 3px rgba(15,23,42,0.12)';\n"
+            "      infoPanel.style.display = 'inline-block';\n"
+            "      if (gd.parentNode) {\n"
+            "        gd.parentNode.insertBefore(infoPanel, gd.nextSibling);\n"
+            "      }\n"
+            "\n"
+            "      const domainStart = frames[0];\n"
+            "      const domainEnd = frames[frames.length - 1];\n"
+            "      const nearlyEqual = (a, b) => Math.abs(a - b) <= Math.max(1, Math.abs(domainEnd - domainStart)) * 1e-6;\n"
+            "\n"
+            "      const findPeakIndex = (range, values) => {\n"
+            "        let candidate = -1;\n"
+            "        let maxValue = -Infinity;\n"
+            "        for (let i = 0; i < frames.length; i += 1) {\n"
+            "          const frame = frames[i];\n"
+            "          if (frame >= range[0] && frame <= range[1]) {\n"
+            "            const value = values[i];\n"
+            "            if (value > maxValue) {\n"
+            "              maxValue = value;\n"
+            "              candidate = i;\n"
+            "            }\n"
+            "          }\n"
+            "        }\n"
+            "        if (candidate !== -1) {\n"
+            "          return candidate;\n"
+            "        }\n"
+            "        let bestDistance = Infinity;\n"
+            "        for (let i = 0; i < frames.length; i += 1) {\n"
+            "          const frame = frames[i];\n"
+            "          const distance = frame < range[0] ? range[0] - frame : frame > range[1] ? frame - range[1] : 0;\n"
+            "          if (distance < bestDistance) {\n"
+            "            bestDistance = distance;\n"
+            "            candidate = i;\n"
+            "          }\n"
+            "        }\n"
+            "        return candidate;\n"
+            "      };\n"
+            "\n"
+            "      const extractRange = (rangeLike) => {\n"
+            "        if (Array.isArray(rangeLike) && rangeLike.length >= 2) {\n"
+            "          return [Number(rangeLike[0]), Number(rangeLike[1])];\n"
+            "        }\n"
+            "        if (rangeLike && Array.isArray(rangeLike.x) && rangeLike.x.length >= 2) {\n"
+            "          return [Number(rangeLike.x[0]), Number(rangeLike.x[1])];\n"
+            "        }\n"
+            "        return [domainStart, domainEnd];\n"
+            "      };\n"
+            "\n"
+            "      const restyleMarker = (traceIndex, frameIndex, values) => {\n"
+            "        if (traceIndex === -1 || frameIndex < 0 || frameIndex >= frames.length) {\n"
+            "          return;\n"
+            "        }\n"
+            "        try {\n"
+            "          Plotly.restyle(gd, {\n"
+            "            x: [[frames[frameIndex]]],\n"
+            "            y: [[values[frameIndex]]]\n"
+            "          }, [traceIndex]);\n"
+            "        } catch (err) {\n"
+            "          /* ignore restyle issues */\n"
+            "        }\n"
+            "      };\n"
+            "\n"
+            "      const applySelectionShape = (start, end) => {\n"
+            "        const coversAll = nearlyEqual(start, domainStart) && nearlyEqual(end, domainEnd);\n"
+            "        const shapes = coversAll ? [] : [{\n"
+            "          type: 'rect',\n"
+            "          xref: 'x',\n"
+            "          x0: start,\n"
+            "          x1: end,\n"
+            "          yref: 'paper',\n"
+            "          y0: 0,\n"
+            "          y1: 1,\n"
+            "          fillcolor: selectionFill,\n"
+            "          line: { color: accentColor, width: 1, dash: 'dot' },\n"
+            "          layer: 'below'\n"
+            "        }];\n"
+            "        try {\n"
+            "          Plotly.relayout(gd, { shapes });\n"
+            "        } catch (err) {\n"
+            "          /* ignore relayout issues */\n"
+            "        }\n"
+            "      };\n"
+            "\n"
+            "      const updateInfoPanel = (start, end, brightnessIndex, blueIndex) => {\n"
+            "        const formatValue = (value, digits = 2) => {\n"
+            "          const numeric = Number.parseFloat(value);\n"
+            "          return Number.isFinite(numeric) ? numeric.toFixed(digits) : 'n/a';\n"
+            "        };\n"
+            "        const parts = [];\n"
+            "        const framesLabel = 'Frames ' + Math.round(start) + '–' + Math.round(end);\n"
+            "        parts.push('<div style=\"font-weight:600;color:' + accentColor + '\">' + framesLabel + '</div>');\n"
+            "        if (brightnessIndex >= 0) {\n"
+            "          const frame = frames[brightnessIndex];\n"
+            "          const value = formatValue(brightnessValues[brightnessIndex]);\n"
+            "          parts.push('<div><strong>L*</strong> frame ' + frame + ' (' + value + ')</div>');\n"
+            "        } else {\n"
+            "          parts.push('<div><strong>L*</strong> peak n/a</div>');\n"
+            "        }\n"
+            "        if (blueIndex >= 0) {\n"
+            "          const frame = frames[blueIndex];\n"
+            "          const value = formatValue(blueValues[blueIndex]);\n"
+            "          parts.push('<div><strong>Blue</strong> frame ' + frame + ' (' + value + ')</div>');\n"
+            "        } else {\n"
+            "          parts.push('<div><strong>Blue</strong> peak n/a</div>');\n"
+            "        }\n"
+            "        infoPanel.innerHTML = parts.join('');\n"
+            "      };\n"
+            "\n"
+            "      const updateSelection = (rangeLike) => {\n"
+            "        const [rawStart, rawEnd] = extractRange(rangeLike);\n"
+            "        const clamp = (value) => Math.min(Math.max(value, domainStart), domainEnd);\n"
+            "        const start = clamp(Math.min(rawStart, rawEnd));\n"
+            "        const end = clamp(Math.max(rawStart, rawEnd));\n"
+            "        const brightnessIndex = findPeakIndex([start, end], brightnessValues);\n"
+            "        const blueIndex = findPeakIndex([start, end], blueValues);\n"
+            "        restyleMarker(selectedMeanIndex, brightnessIndex, brightnessValues);\n"
+            "        restyleMarker(selectedBlueIndex, blueIndex, blueValues);\n"
+            "        applySelectionShape(start, end);\n"
+            "        updateInfoPanel(start, end, brightnessIndex, blueIndex);\n"
+            "      };\n"
+            "\n"
+            "      const reset = () => {\n"
+            "        updateSelection([domainStart, domainEnd]);\n"
+            "      };\n"
+            "\n"
+            "      gd.on('plotly_selected', (eventData) => {\n"
+            "        if (eventData && eventData.range && eventData.range.x) {\n"
+            "          updateSelection(eventData.range);\n"
+            "        }\n"
+            "      });\n"
+            "      gd.on('plotly_selecting', (eventData) => {\n"
+            "        if (eventData && eventData.range && eventData.range.x) {\n"
+            "          updateSelection(eventData.range);\n"
+            "        }\n"
+            "      });\n"
+            "      gd.on('plotly_doubleclick', reset);\n"
+            "      gd.on('plotly_deselect', reset);\n"
+            "\n"
+            "      reset();\n"
+            "      return true;\n"
+            "    };\n"
+            "\n"
+            "    if (!initialiseWhenReady()) {\n"
+            "      const handler = () => {\n"
+            "        if (initialiseWhenReady() && gd.removeListener) {\n"
+            "          gd.removeListener('plotly_afterplot', handler);\n"
+            "        }\n"
+            "      };\n"
+            "      if (gd.on) {\n"
+            "        gd.on('plotly_afterplot', handler);\n"
+            "      } else {\n"
+            "        setTimeout(handler, 60);\n"
+            "      }\n"
+            "    }\n"
+            "  };\n"
+            "\n"
+            "  if (document.readyState === 'loading') {\n"
+            "    document.addEventListener('DOMContentLoaded', createSelectionEnhancements, { once: true });\n"
+            "  } else {\n"
+            "    createSelectionEnhancements();\n"
+            "  }\n"
+            "})();"
+        )
+
+        return script.substitute(
+            div_id=div_id,
+            frames_json=frames_json,
+            brightness_json=brightness_json,
+            blue_json=blue_json,
+            accent_color=accent_color,
+            selection_fill=selection_fill,
+            font_family=font_family,
+        )
+
+    # --- Utility Methods ---
+
+    def _validate_run_duration(self, start_frame: int, end_frame: int, expected_duration: float) -> float:
+        """
+        Calculate confidence score for detected run vs expected duration.
+        
+        Args:
+            start_frame: Start frame of detected run
+            end_frame: End frame of detected run
+            expected_duration: Expected duration in seconds
+            
+        Returns:
+            Confidence score from 0.0 to 1.0 (1.0 = perfect match)
+        """
+        if expected_duration <= 0.0 or not self.cap:
+            return 1.0
+
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        return analysis_validate_run_duration(start_frame, end_frame, expected_duration, fps)
+
+    def _compute_l_star_frame(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Convert a BGR frame to its L* channel (0-100) once for reuse across ROIs.
+        """
+        return analysis_compute_l_star_frame(frame)
+
+    def _compute_brightness_stats(
+        self,
+        roi_bgr: np.ndarray,
+        background_brightness: Optional[float] = None,
+        roi_mask: Optional[np.ndarray] = None,
+        roi_l_star: Optional[np.ndarray] = None,
+    ) -> Tuple[float, float, float, float, float, float, float, float]:
+        """
+        Calculates brightness statistics for an ROI with optional background subtraction.
+
+        Converts BGR to CIE LAB color space and uses the L* channel.
+        Also extracts blue channel statistics for blue light analysis.
+
+        Args:
+            roi_bgr: The region of interest as a NumPy array (BGR format).
+            background_brightness: Optional background L* value to subtract from all pixels.
+            roi_mask: Optional boolean mask selecting pixels to analyze within ROI.
+            roi_l_star: Optional precomputed L* slice aligned with roi_bgr to avoid redundant conversions.
+
+        Returns:
+            Tuple of (l_raw_mean, l_raw_median, l_bg_sub_mean, l_bg_sub_median, 
+                     b_raw_mean, b_raw_median, b_bg_sub_mean, b_bg_sub_median)
+            L* values in 0-100 range, Blue values in 0-255 range
+            or (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0) if the ROI is invalid or calculation fails.
+        """
+        return analysis_compute_brightness_stats(
+            roi_bgr=roi_bgr,
+            background_brightness=background_brightness,
+            roi_mask=roi_mask,
+            roi_l_star=roi_l_star,
+            morphological_kernel_size=self.morphological_kernel_size,
+            noise_floor_threshold=self.noise_floor_threshold,
+        )
+
+    def _compute_background_brightness(
+        self,
+        frame: np.ndarray,
+        frame_l_star: Optional[np.ndarray] = None,
+    ) -> Optional[float]:
+        """
+        Calculate background ROI brightness for current frame.
+        
+        Args:
+            frame: Current video frame in BGR format
+            frame_l_star: Optional precomputed L* channel for the frame to avoid recomputation.
+            
+        Returns:
+            90th percentile L* brightness of background ROI, or None if no background ROI defined
+        """
+        return analysis_compute_background_brightness(
+            frame=frame,
+            rects=self.rects,
+            background_roi_idx=self.background_roi_idx,
+            background_percentile=self.background_percentile,
+            frame_l_star=frame_l_star,
+        )
+
+    def _compute_brightness(self, roi_bgr: np.ndarray) -> float:
+        """
+        Legacy method for backward compatibility.
+        Returns only the mean brightness for existing code that expects a single value.
+        """
+        return analysis_compute_brightness(
+            roi_bgr,
+            morphological_kernel_size=self.morphological_kernel_size,
+            noise_floor_threshold=self.noise_floor_threshold,
+        )
